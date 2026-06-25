@@ -1,5 +1,38 @@
 # zcode-proxy 使用说明
 
+> **v0.1.5 — 代码质量优化 + Anthropic 强制流式输出 + 代理测试连接 + 上游超时配置**
+>
+> 本次更新包含大量代码质量改进和新功能。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。
+>
+> **新功能 1：Anthropic 格式强制流式输出**
+> - 新增 `anthropic.forceStream` 配置项（YAML）和 `ZCODE_PROXY_FORCE_STREAM_ANTHROPIC=1` 环境变量
+> - 开启后，对 Anthropic 格式（/v1/messages）的请求强制设置 `stream: true`，即使客户端发送的是非流式请求
+> - 这使得 Claude Code 等默认非流式的客户端也能实时逐 token 输出，而不是等待完整响应
+> - 仅影响 Anthropic 直通路径，OpenAI / Responses 格式不受影响
+> - Dashboard 日志配置页新增「Anthropic 强制流式输出」开关，支持热切换无需重启
+>
+> **新功能 2：上游请求超时配置**
+> - 新增 `server.upstreamTimeoutMs` 配置项（默认 300000ms = 5 分钟）
+> - 可通过 `ZCODE_UPSTREAM_TIMEOUT_MS` 环境变量覆盖
+> - 防止挂起的上游连接无限期占用资源
+>
+> **已有功能确认：账号代理测试连接**
+> - Dashboard 已支持代理测试功能（POST /admin/api/accounts/proxy-test）
+> - 可在账号设置中输入代理 URL 后点击测试，验证代理是否可达目标上游
+> - 支持 http/https/socks5 代理，10 秒超时，返回延迟和状态信息
+>
+> **代码质量优化（10项）**
+> - 修复 `resolvePositiveInt` 语义错误：函数名说"正整数"但实际允许 0，已改为 `> 0`；`maxRetries` 改用 `resolveNonNegativeInt`
+> - 移除 `sse-translator.ts` 中重复定义的 `ParsedSSE` 接口，改为从 `utils/sse.ts` 统一导入
+> - 修复 `tsconfig.json` 的 `types` 字段：`bun-types` → `@types/bun`，匹配实际安装的 devDependency
+> - 重构 `BigmodelOAuthClient`：消除 ~80 行重复的回调服务器代码，复用共享的 `CallbackServer` 类
+> - 格式化 `captcha.ts` 中超长单行 polyfill 代码，拆分为可读的多行格式
+> - 消除硬编码 VERSION 常量：从 `package.json` 动态读取版本号，单点维护
+> - CORS allowlist 依赖注入：移除 `globalThis` hack，改为通过 `ProxyConfig.corsAllowList` 配置字段传递
+> - 启用 `noUnusedLocals` / `noUnusedParameters` 严格检查，清理所有未使用的导入/变量
+> - 增强 SSE 流 reader 安全释放：`controller.close()` 和 `reader.releaseLock()` 加 try-catch 防止二次操作抛异常
+> - 清理多个文件中未使用的导入和变量（api.ts / handler.ts / anthropic-to-openai.ts 等）
+>
 > **vceshi0.1.4 — 凭证变破损根因修复 + 调试日志 + 导入不自动激活 + 切换后 activeId 同步**
 >
 > 本次修复用户反馈的 4 个问题。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过（新增 2 个回归测试）。

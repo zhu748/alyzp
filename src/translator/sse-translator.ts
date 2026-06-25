@@ -4,20 +4,7 @@
  * @see https://docs.anthropic.com/en/api/messages-streaming
  */
 import type { AnthropicStreamEvent, OpenAIStreamChunk } from "./types.js";
-import { parseSSEChunk, waitForBackpressure } from "../utils/sse.js";
-
-const ANTHROPIC_SSE_PREFIX = "event: ";
-const SSE_DATA_PREFIX = "data: ";
-
-/** Parse a raw SSE chunk string into event type + JSON data.
- *
- * Re-exported from utils/sse.ts. The local interface is kept for backward
- * compatibility with internal callers that import ParsedSSE from this module.
- */
-interface ParsedSSE {
-  event: string;
-  data: unknown;
-}
+import { parseSSEChunk, waitForBackpressure, type ParsedSSE } from "../utils/sse.js";
 
 interface TranslationState {
   messageId: string;
@@ -113,8 +100,8 @@ export function anthropicSseToOpenaiSse(
       } catch (err) {
         controller.error(err);
       } finally {
-        controller.close();
-        reader.releaseLock();
+        try { controller.close(); } catch {}
+        try { reader.releaseLock(); } catch {}
       }
     },
   });
@@ -297,8 +284,8 @@ export function openaiSseToAnthropicSse(
       } catch (err) {
         controller.error(err);
       } finally {
-        controller.close();
-        reader.releaseLock();
+        try { controller.close(); } catch {}
+        try { reader.releaseLock(); } catch {}
       }
     },
   });

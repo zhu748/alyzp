@@ -129,21 +129,98 @@ function waitFor(cond: () => boolean, ms: number): Promise<void> {
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function applyPolyfills(window: any): void {
-  window.matchMedia = () => ({ matches: false, media: "", onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; } });
+  // --- matchMedia polyfill ---
+  window.matchMedia = () => ({
+    matches: false, media: "", onchange: null,
+    addListener() {}, removeListener() {},
+    addEventListener() {}, removeEventListener() {},
+    dispatchEvent() { return false; },
+  });
+
+  // --- Canvas polyfills ---
   const proto = window.HTMLCanvasElement.prototype;
+
   proto.getContext = function (type: string) {
-    if (/webgl/i.test(type)) return { canvas: this, getParameter: () => "Intel Inc.", getExtension: () => null, getSupportedExtensions: () => ["WEBGL_debug_renderer_info"], getContextAttributes: () => ({}), getShaderPrecisionFormat: () => ({ precision: 23, rangeMin: 127, rangeMax: 127 }) };
-    return { canvas: this, fillRect() {}, clearRect() {}, getImageData: (x: number, y: number, w = 1, h = 1) => ({ data: new Uint8ClampedArray(w * h * 4) }), putImageData() {}, createImageData: (w = 1, h = 1) => ({ data: new Uint8ClampedArray(w * h * 4) }), setTransform() {}, transform() {}, drawImage() {}, save() {}, restore() {}, beginPath() {}, moveTo() {}, lineTo() {}, bezierCurveTo() {}, quadraticCurveTo() {}, closePath() {}, clip() {}, stroke() {}, fill() {}, arc() {}, rect() {}, ellipse() {}, translate() {}, scale() {}, rotate() {}, fillText() {}, strokeText() {}, measureText: (t: string) => ({ width: ("" + t).length * 8 }), createLinearGradient: () => ({ addColorStop() {} }), createRadialGradient: () => ({ addColorStop() {} }), createPattern: () => ({}), isPointInPath: () => false, font: "10px sans-serif", textBaseline: "alphabetic", textAlign: "start", fillStyle: "#000", strokeStyle: "#000", globalAlpha: 1, lineWidth: 1, shadowBlur: 0, shadowColor: "" };
+    if (/webgl/i.test(type)) {
+      return {
+        canvas: this,
+        getParameter: () => "Intel Inc.",
+        getExtension: () => null,
+        getSupportedExtensions: () => ["WEBGL_debug_renderer_info"],
+        getContextAttributes: () => ({}),
+        getShaderPrecisionFormat: () => ({ precision: 23, rangeMin: 127, rangeMax: 127 }),
+      };
+    }
+    return {
+      canvas: this,
+      fillRect() {}, clearRect() {},
+      getImageData: (_x: number, _y: number, w = 1, h = 1) => ({
+        data: new Uint8ClampedArray(w * h * 4),
+      }),
+      putImageData() {},
+      createImageData: (w = 1, h = 1) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+      setTransform() {}, transform() {}, drawImage() {},
+      save() {}, restore() {}, beginPath() {}, moveTo() {}, lineTo() {},
+      bezierCurveTo() {}, quadraticCurveTo() {}, closePath() {},
+      clip() {}, stroke() {}, fill() {}, arc() {}, rect() {},
+      ellipse() {}, translate() {}, scale() {}, rotate() {},
+      fillText() {}, strokeText() {},
+      measureText: (t: string) => ({ width: ("" + t).length * 8 }),
+      createLinearGradient: () => ({ addColorStop() {} }),
+      createRadialGradient: () => ({ addColorStop() {} }),
+      createPattern: () => ({}),
+      isPointInPath: () => false,
+      font: "10px sans-serif", textBaseline: "alphabetic", textAlign: "start",
+      fillStyle: "#000", strokeStyle: "#000", globalAlpha: 1, lineWidth: 1,
+      shadowBlur: 0, shadowColor: "",
+    };
   };
-  proto.toDataURL = () => "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+  proto.toDataURL = () =>
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
   proto.toBlob = (cb: any) => cb && cb(null);
-  window.Worker = class { postMessage() {} terminate() {} addEventListener() {} removeEventListener() {} onmessage = null; onerror = null; };
-  window.OffscreenCanvas = class { width = 0; height = 0; constructor(w: number, h: number) { this.width = w; this.height = h; } getContext() { return proto.getContext.call(this); } };
-  try { Object.defineProperty(window.document, "hidden", { value: false, configurable: true }); Object.defineProperty(window.document, "visibilityState", { value: "visible", configurable: true }); } catch {}
-  const nav = window.navigator;
-  for (const [k, v] of Object.entries({ userAgent: FAKE_UA, platform: "Win32", language: "en-US", languages: ["en-US", "en"], vendor: "Google Inc.", webdriver: false, hardwareConcurrency: 8, deviceMemory: 8, maxTouchPoints: 0, cookieEnabled: true, plugins: { length: 3, item: (): null => null, namedItem: (): null => null, refresh() {} }, mimeTypes: { length: 0, item: (): null => null, namedItem: (): null => null } })) { try { Object.defineProperty(nav, k, { value: v, configurable: true }); } catch {} }
-  window.screen = { width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24, pixelDepth: 24 };
-  window.chrome = { runtime: {} }; window.outerWidth = 1920; window.outerHeight = 1080; window.innerWidth = 1280; window.innerHeight = 720; window.devicePixelRatio = 1;
+
+  // --- Worker / OffscreenCanvas polyfills ---
+  window.Worker = class {
+    postMessage() {} terminate() {}
+    addEventListener() {} removeEventListener() {}
+    onmessage = null; onerror = null;
+  };
+  window.OffscreenCanvas = class {
+    width = 0; height = 0;
+    constructor(w: number, h: number) { this.width = w; this.height = h; }
+    getContext() { return proto.getContext.call(this); }
+  };
+
+  // --- Document visibility polyfill ---
+  try {
+    Object.defineProperty(window.document, "hidden", { value: false, configurable: true });
+    Object.defineProperty(window.document, "visibilityState", { value: "visible", configurable: true });
+  } catch {}
+
+  // --- Navigator polyfills ---
+  const navProps: Record<string, unknown> = {
+    userAgent: FAKE_UA, platform: "Win32", language: "en-US",
+    languages: ["en-US", "en"], vendor: "Google Inc.", webdriver: false,
+    hardwareConcurrency: 8, deviceMemory: 8, maxTouchPoints: 0, cookieEnabled: true,
+    plugins: { length: 3, item: (): null => null, namedItem: (): null => null, refresh() {} },
+    mimeTypes: { length: 0, item: (): null => null, namedItem: (): null => null },
+  };
+  for (const [k, v] of Object.entries(navProps)) {
+    try { Object.defineProperty(window.navigator, k, { value: v, configurable: true }); } catch {}
+  }
+
+  // --- Screen / viewport polyfills ---
+  window.screen = {
+    width: 1920, height: 1080, availWidth: 1920, availHeight: 1040,
+    colorDepth: 24, pixelDepth: 24,
+  };
+  window.chrome = { runtime: {} };
+  window.outerWidth = 1920;
+  window.outerHeight = 1080;
+  window.innerWidth = 1280;
+  window.innerHeight = 720;
+  window.devicePixelRatio = 1;
 }
 
 export const RETRY_HEADERS = { PARAM: CAPTCHA_HEADER, REGION: REGION_HEADER };

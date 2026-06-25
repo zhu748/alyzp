@@ -1260,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.1.4</span>
+        <span>v0.1.5</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1540,6 +1540,11 @@ td input{font-family:var(--font-mono)}
                 <label class="form-label">调试响应日志</label>
                 <label class="switch"><input type="checkbox" id="cfgDebugLog"><span class="slider"></span></label>
                 <div class="form-help">开启后，每个请求在上游响应返回时输出完整响应详情：1) 状态码 + 关键响应头（content-type / retry-after / empty-stream / ratelimit-remaining）2) 响应体预览（JSON 前 1000 字符 / SSE 流前 2KB）。能看到 529 / 空回 200 / 验证码 403 具体返回了什么 JSON。用 resp.clone() 读取副本，不影响下游 passthrough。默认关闭。</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Anthropic 强制流式输出</label>
+                <label class="switch"><input type="checkbox" id="cfgForceStreamAnthropic"><span class="slider"></span></label>
+                <div class="form-help">开启后，对 Anthropic 格式（/v1/messages）的请求强制设置 stream:true，即使客户端发送的是非流式请求。这使得 Claude Code 等默认非流式的客户端也能实时逐 token 输出，而不是等待完整响应。仅影响 Anthropic 直通路径，OpenAI / Responses 格式不受影响。默认关闭（保持客户端原始 stream 设置）。也可通过环境变量 ZCODE_PROXY_FORCE_STREAM_ANTHROPIC=1 开启。</div>
               </div>
             </div>
           </div>
@@ -2454,6 +2459,7 @@ async function loadSettings(){
     document.getElementById('cfgLogLevel').value=c.logging?.level||'info';
     document.getElementById('cfgVerboseLog').checked=!!c.logging?.verbose;
     document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
+    document.getElementById('cfgForceStreamAnthropic').checked=!!c.forceStreamAnthropic;
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
@@ -2515,7 +2521,8 @@ async function saveSettings(){
       emptyStreamSwitchThreshold:Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch>=0?emptyStreamSwitch:3,
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
-    logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked}
+    logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked},
+    forceStreamAnthropic:document.getElementById('cfgForceStreamAnthropic').checked
   };
   const apiKey=document.getElementById('cfgApiKey').value;
   const proxyApiKey=document.getElementById('cfgProxyApiKey').value;

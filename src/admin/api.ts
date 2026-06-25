@@ -11,13 +11,11 @@ import { loadCredential, saveCredential, clearCredential, listAccounts, switchAc
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
-import { readZCodeImport, detectZCodeProvider, listAvailableZCodeImports, isApiKeyFormat } from "../auth/zcode-config.js";
+import { readZCodeImport, detectZCodeProvider, listAvailableZCodeImports } from "../auth/zcode-config.js";
 import { errorResponse } from "../proxy/handler.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
 import { MODELS as GLM_CATALOG } from "../provider/models.js";
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
 import { stringify as stringifyYaml } from "yaml";
 // Inline the dashboard HTML at build time so it works inside a
 // `bun build --compile` single-file executable. Runtime `readFileSync`
@@ -550,6 +548,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       opts.config.routingRules = newConfig.routingRules;
       opts.config.modelMappings = newConfig.modelMappings;
       if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
+      if (newConfig.forceStreamAnthropic !== undefined) opts.config.forceStreamAnthropic = newConfig.forceStreamAnthropic;
       if (authBody) opts.config.auth = newConfig.auth;
       // providers.*.anthropicBase / openaiBase: also hot-swappable
       if (body.providers) {
@@ -725,12 +724,10 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       // plan. Without this, the proxy would keep using the old plan until
       // restart — defeating the purpose of the dashboard edit.
       const cred = await loadCredential();
-      let planSynced = false;
       if (cred) {
         opts.auth.setOAuthCredential(cred);
         if (cred.plan && cred.plan !== opts.config.plan) {
           opts.config.plan = cred.plan;
-          planSynced = true;
           appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
         }
       }

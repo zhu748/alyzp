@@ -21,6 +21,7 @@
  */
 import type { ProviderId } from "../provider/types.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+// IncomingMessage and ServerResponse are used by the CallbackServer class below.
 import { randomBytes } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -92,8 +93,7 @@ interface ZaiEnvelope {
 }
 
 // ---------------------------------------------------------------------------
-// Shared localhost callback server (used by the Z.AI flow; Bigmodel keeps its
-// own equivalent inline below for backward compatibility)
+// Shared localhost callback server (used by both Z.AI and Bigmodel OAuth flows)
 // ---------------------------------------------------------------------------
 
 /**
@@ -362,7 +362,7 @@ const ZCODE_TOKEN_ENDPOINT = "https://zcode.z.ai/api/v1/oauth/token";
  * @see ~/.zcode/v2/logs — [bigmodelOAuth] zcode token request
  */
 export class BigmodelOAuthClient {
-  private server: Server | null = null;
+  private cb: CallbackServer | null = null;
 
   constructor(
     private fetchImpl: FetchFn = fetch,
@@ -376,90 +376,28 @@ export class BigmodelOAuthClient {
    */
   async start(): Promise<{ authorizeUrl: string; callbackUrl: string; state: string }> {
     const state = randomBytes(32).toString("hex");
+    this.cb = new CallbackServer(
+      BIGMODEL_CALLBACK_PATH,
+      state,
+      "Authorization successful! You may close this window and return to the CLI.",
+      (reason) => `Authorization failed: ${reason}`,
+    );
+    await this.cb.listen();
 
-    return new Promise((resolve, reject) => {
-      this.server = createServer((req: IncomingMessage, res: ServerResponse) => {
-        this.handleCallback(req, res, state);
-      });
-
-      this.server.on("error", reject);
-      this.server.listen(0, "127.0.0.1", () => {
-        const addr = this.server!.address();
-        if (!addr || typeof addr !== "object") {
-          reject(new Error("Failed to bind localhost callback server"));
-          return;
-        }
-        const port = addr.port;
-        const callbackUrl = `http://127.0.0.1:${port}${BIGMODEL_CALLBACK_PATH}`;
-
-        const params = new URLSearchParams({
-          appId: this.appId,
-          redirect: callbackUrl,
-          state,
-        });
-        const authorizeUrl = `${this.host}/login?${params.toString()}`;
-
-        resolve({ authorizeUrl, callbackUrl, state });
-      });
+    const params = new URLSearchParams({
+      appId: this.appId,
+      redirect: this.cb.callbackUrl,
+      state,
     });
-  }
+    const authorizeUrl = `${this.host}/login?${params.toString()}`;
 
-  private callbackResult: { code: string; error: string | null } | null = null;
-  private callbackWaiters: Array<(result: { code: string; error: string | null }) => void> = [];
-
-  private handleCallback(req: IncomingMessage, res: ServerResponse, expectedState: string): void {
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (url.pathname !== BIGMODEL_CALLBACK_PATH) {
-      res.writeHead(404, { "Content-Type": "text/plain" });
-      res.end("Not found");
-      return;
-    }
-
-    const state = url.searchParams.get("state") ?? "";
-    const code = url.searchParams.get("authCode") ?? url.searchParams.get("code") ?? "";
-
-    if (state !== expectedState || !code) {
-      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Authorization failed: state mismatch or missing code.");
-      if (!this.callbackResult) {
-        this.callbackResult = { code: "", error: "OAuth callback state mismatch or missing code." };
-        this.callbackWaiters.forEach((fn) => fn(this.callbackResult!));
-      }
-      return;
-    }
-
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end("Authorization successful! You may close this window and return to the CLI.");
-
-    if (!this.callbackResult) {
-      this.callbackResult = { code, error: null };
-      this.callbackWaiters.forEach((fn) => fn(this.callbackResult!));
-    }
+    return { authorizeUrl, callbackUrl: this.cb.callbackUrl, state };
   }
 
   /** Wait for the OAuth callback redirect. Resolves with authCode. */
   async waitForCallback(timeoutMs: number = 300_000): Promise<string> {
-    if (this.callbackResult?.code) {
-      return this.callbackResult.code;
-    }
-    if (this.callbackResult?.error) {
-      throw new Error(this.callbackResult.error);
-    }
-
-    return new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error("Authorization timed out. Please retry login."));
-      }, timeoutMs);
-
-      this.callbackWaiters.push((result) => {
-        clearTimeout(timer);
-        if (result.error) {
-          reject(new Error(result.error));
-        } else {
-          resolve(result.code);
-        }
-      });
-    });
+    if (!this.cb) throw new Error("OAuth server not started — call start() first");
+    return this.cb.waitForCallback(timeoutMs);
   }
 
   /**
@@ -534,11 +472,9 @@ export class BigmodelOAuthClient {
   }
 
   async close(): Promise<void> {
-    if (this.server) {
-      await new Promise<void>((resolve) => {
-        this.server!.close(() => resolve());
-      });
-      this.server = null;
+    if (this.cb) {
+      await this.cb.close();
+      this.cb = null;
     }
   }
 }

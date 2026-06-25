@@ -111,7 +111,6 @@ export function translateResponseAnthropicToResponses(
 // ─────────────────────────────────────────────
 
 const SSE_DATA_PREFIX = "data: ";
-const ANTHROPIC_SSE_PREFIX = "event: ";
 
 interface ParsedSSE {
   event: string;

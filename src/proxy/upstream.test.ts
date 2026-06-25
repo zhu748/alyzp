@@ -2,7 +2,7 @@
  * Tests for upstream request builder and proxy handler.
  * @see .omo/plans/zcode-proxy.md Task 6
  */
-import { describe, it, expect, mock, beforeEach } from "bun:test";
+import { describe, it, expect, mock } from "bun:test";
 import { buildUpstreamRequest, buildUpstreamURL, buildAuthHeaders } from "./upstream.js";
 import { proxyRequest, errorResponse } from "./handler.js";
 import { ZAI_PROVIDER, BIGMODEL_PROVIDER } from "../provider/providers.js";
@@ -664,7 +664,7 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
 
   it("passes cred.proxy as { proxy } option to fetch when set", async () => {
     let receivedProxy: string | undefined;
-    const fetchMock = mock(async (req: Request, init?: any): Promise<Response> => {
+    const fetchMock = mock(async (_req: Request, init?: any): Promise<Response> => {
       receivedProxy = init?.proxy;
       return new Response(successBody, {
         status: 200,
@@ -689,7 +689,7 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
   it("does NOT pass proxy option when cred.proxy is unset", async () => {
     let receivedProxy: unknown = "sentinel";
     let initKeys: string[] | undefined;
-    const fetchMock = mock(async (req: Request, init?: any): Promise<Response> => {
+    const fetchMock = mock(async (_req: Request, init?: any): Promise<Response> => {
       receivedProxy = init?.proxy;
       initKeys = init ? Object.keys(init) : undefined;
       return new Response(successBody, {

@@ -145,3 +145,15 @@ retry:
 # 代理规则 → Responses 思考管理.
 responsesThinking:
   models: []
+
+# --- Anthropic format options ---
+anthropic:
+  # Force-enable streaming for Anthropic /v1/messages requests.
+  # When true, the proxy overrides the client's stream preference (including
+  # stream:false or missing stream field) to stream:true before forwarding
+  # upstream. This gives real-time token-by-token output instead of waiting
+  # for the full batch response.
+  # Only affects the Anthropic passthrough path; OpenAI/Responses formats are
+  # unaffected (they already default to streaming in most clients).
+  # Default: false. Env var: ZCODE_PROXY_FORCE_STREAM_ANTHROPIC=1
+  forceStream: false

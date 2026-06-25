@@ -25,6 +25,7 @@ export interface ServerOptions {
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
   const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl };
+  const corsAllow = config.corsAllowList;
 
   const adminOpts: AdminOptions = {
     config,
@@ -51,13 +52,13 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
   // a parameter to each handler, so no mutation is needed.
   type RouteHandler = (req: Request) => Promise<Response> | Response;
   const routes = new Map<string, RouteHandler>([
-    ["GET:/health", (req) => addCorsHeaders(healthResponse(), req)],
-    ["GET:/healthz", (req) => addCorsHeaders(healthResponse(), req)],
-    ["GET:/", (req) => addCorsHeaders(healthResponse(), req)],
-    ["GET:/v1/models", (req) => addCorsHeaders(handleListModels(), req)],
-    ["POST:/v1/chat/completions", async (req) => addCorsHeaders(await handleChatCompletions(req, proxyOpts), req)],
-    ["POST:/v1/messages", async (req) => addCorsHeaders(await handleMessages(req, proxyOpts), req)],
-    ["POST:/v1/responses", async (req) => addCorsHeaders(await handleResponses(req, proxyOpts), req)],
+    ["GET:/health", (req) => addCorsHeaders(healthResponse(), req, corsAllow)],
+    ["GET:/healthz", (req) => addCorsHeaders(healthResponse(), req, corsAllow)],
+    ["GET:/", (req) => addCorsHeaders(healthResponse(), req, corsAllow)],
+    ["GET:/v1/models", (req) => addCorsHeaders(handleListModels(), req, corsAllow)],
+    ["POST:/v1/chat/completions", async (req) => addCorsHeaders(await handleChatCompletions(req, proxyOpts), req, corsAllow)],
+    ["POST:/v1/messages", async (req) => addCorsHeaders(await handleMessages(req, proxyOpts), req, corsAllow)],
+    ["POST:/v1/responses", async (req) => addCorsHeaders(await handleResponses(req, proxyOpts), req, corsAllow)],
   ]);
 
   return async (req: Request): Promise<Response> => {
@@ -67,14 +68,14 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
 
     // CORS preflight — short-circuit before auth
     if (method === "OPTIONS") {
-      return corsResponse(req);
+      return corsResponse(req, corsAllow);
     }
 
     // Admin dashboard routes (handled before proxy API key auth).
     // Admin page itself is open; API routes use proxyApiKey.
     if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/api/")) {
       const adminResp = await handleAdminRoute(req, adminOpts);
-      if (adminResp) return addCorsHeaders(adminResp, req);
+      if (adminResp) return addCorsHeaders(adminResp, req, corsAllow);
     }
 
     // Health checks are ALWAYS open — Render/Fly/Cloud Run/K8s probes don't
@@ -83,14 +84,14 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     // response leaks no sensitive info (just `{status:"ok", provider}`).
     // Both `/health` (legacy) and `/healthz` (K8s convention) work.
     if (path === "/health" || path === "/healthz" || path === "/") {
-      return addCorsHeaders(healthResponse(), req);
+      return addCorsHeaders(healthResponse(), req, corsAllow);
     }
 
     // Proxy API key auth (if configured) — applies to all non-admin, non-health routes
     if (config.auth.proxyApiKey) {
       const authHeader = req.headers.get("authorization") ?? req.headers.get("x-api-key");
       if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {
-        return addCorsHeaders(errorResponse(401, "authentication_error", "Invalid or missing proxy API key"), req);
+        return addCorsHeaders(errorResponse(401, "authentication_error", "Invalid or missing proxy API key"), req, corsAllow);
       }
     }
 
@@ -100,7 +101,7 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
       return await handler(req);
     }
 
-    return addCorsHeaders(errorResponse(404, "not_found_error", `No route for ${method} ${path}`), req);
+    return addCorsHeaders(errorResponse(404, "not_found_error", `No route for ${method} ${path}`), req, corsAllow);
   };
 }
 
@@ -138,17 +139,17 @@ function checkProxyKey(authHeader: string, expected: string): boolean {
 }
 
 /** Build a CORS preflight response. */
-function corsResponse(req: Request): Response {
+function corsResponse(req: Request, allowList?: string[]): Response {
   return new Response(null, {
     status: 204,
-    headers: corsHeaders(req),
+    headers: corsHeaders(req, allowList),
   });
 }
 
 /** Add CORS headers to an existing response (non-mutating). */
-function addCorsHeaders(resp: Response, req: Request): Response {
+function addCorsHeaders(resp: Response, req: Request, allowList?: string[]): Response {
   const headers = new Headers(resp.headers);
-  for (const [k, v] of Object.entries(corsHeaders(req))) {
+  for (const [k, v] of Object.entries(corsHeaders(req, allowList))) {
     headers.set(k, v);
   }
   return new Response(resp.body, {
@@ -158,7 +159,7 @@ function addCorsHeaders(resp: Response, req: Request): Response {
   });
 }
 
-function corsHeaders(req: Request): Record<string, string> {
+function corsHeaders(req: Request, allowList?: string[]): Record<string, string> {
   // Echo the requesting Origin only when it's been explicitly allowed, OR
   // when no allowlist is configured (preserving the old permissive behavior
   // for backwards compatibility). When the origin is NOT in the allowlist,
@@ -171,7 +172,6 @@ function corsHeaders(req: Request): Record<string, string> {
   // When no Origin header is present (server-to-server / curl), fall back to
   // "*" for compatibility with simple clients.
   const origin = req.headers.get("origin");
-  const allowList = (globalThis as any).__ZCODE_PROXY_CORS_ALLOWLIST__ as string[] | undefined;
   let allowOrigin: string;
   if (!origin) {
     allowOrigin = "*";

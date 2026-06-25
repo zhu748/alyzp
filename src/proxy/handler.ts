@@ -16,7 +16,7 @@ import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
 import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
-import { transformRequestBody, transformRequestBodyObj } from "./body-transformer.js";
+import { transformRequestBodyObj } from "./body-transformer.js";
 import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { detectSseErrorAndConvert } from "./sse-error-detector.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
@@ -185,6 +185,22 @@ export async function proxyRequest(
   };
 
   let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan" });
+
+  // Force-enable streaming for Anthropic format when config.forceStreamAnthropic
+  // is true. Overrides the client's stream preference (including missing/undefined
+  // and stream:false) so the upstream returns SSE — giving the client real-time
+  // token-by-token output instead of waiting for the full batch response.
+  // Only applies to the Anthropic passthrough path (format === "anthropic");
+  // translation modes (openai / openai-responses) already default to streaming.
+  if (format === "anthropic" && config.forceStreamAnthropic && transformedObj && typeof transformedObj === "object") {
+    const obj = transformedObj as Record<string, unknown>;
+    if (obj.stream !== true) {
+      console.log(`${reqId} force-stream: overriding stream=${obj.stream ?? "(unset)"} → true (forceStreamAnthropic enabled)`);
+      obj.stream = true;
+      meta.stream = true;
+    }
+  }
+
   let transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
 
   // Diagnostic: log thinking-block strip counts so users can verify the fix

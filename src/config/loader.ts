@@ -23,11 +23,13 @@ const ENV = {
   RETRY_STATUSES: "ZCODE_RETRY_STATUSES",
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: "ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD",
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: "ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD",
+  UPSTREAM_TIMEOUT_MS: "ZCODE_UPSTREAM_TIMEOUT_MS",
 } as const;
 
 const DEFAULTS = {
   PORT: 8080,
   HOST: "0.0.0.0",
+  UPSTREAM_TIMEOUT_MS: 300_000,
   PROVIDER: "zai" as const,
   PLAN: "coding-plan" as const,
   DEFAULT_MODEL: "glm-4.6",
@@ -66,6 +68,10 @@ export function loadConfig(path: string): ProxyConfig {
   // --- server ---
   const port = resolvePort(process.env[ENV.PORT] ?? parsed?.server?.port);
   const host = typeof parsed?.server?.host === "string" ? parsed.server.host : DEFAULTS.HOST;
+  const upstreamTimeoutMs = resolveNonNegativeInt(
+    process.env[ENV.UPSTREAM_TIMEOUT_MS] ?? parsed?.server?.upstreamTimeoutMs,
+    DEFAULTS.UPSTREAM_TIMEOUT_MS,
+  );
 
   // --- auth ---
   const proxyApiKey = process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
@@ -139,14 +145,23 @@ export function loadConfig(path: string): ProxyConfig {
   const debugLogging = process.env.ZCODE_PROXY_DEBUG_LOGGING === "1"
     || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.debug === true);
 
+  // --- CORS allowlist ---
+  const corsAllowList = resolveCorsAllowList(process.env.ZCODE_PROXY_CORS_ALLOWLIST);
+
+  // --- Force stream for Anthropic ---
+  const forceStreamAnthropic = process.env.ZCODE_PROXY_FORCE_STREAM_ANTHROPIC === "1"
+    || parsed?.anthropic?.forceStream === true;
+
   const config: ProxyConfig = {
-    server: { port, host },
+    server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
     provider,
     plan,
     providers: { zai, bigmodel },
     defaultModel,
     models,
+    forceStreamAnthropic,
+    corsAllowList,
     identity,
     logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging },
     retry,
@@ -219,7 +234,7 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
 function resolveRetry(raw?: unknown): RetryConfig {
   const r = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
 
-  const maxRetries = resolvePositiveInt(
+  const maxRetries = resolveNonNegativeInt(
     process.env[ENV.RETRY_MAX] ?? r.maxRetries,
     DEFAULTS.RETRY_MAX_RETRIES,
   );
@@ -271,11 +286,11 @@ function resolveNonNegativeInt(raw: unknown, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
 }
 
-/** Resolve a positive integer from a raw value, falling back to default. */
+/** Resolve a positive integer (> 0) from a raw value, falling back to default. */
 function resolvePositiveInt(raw: unknown, fallback: number): number {
   if (raw === undefined || raw === null) return fallback;
   const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
-  return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
 }
 
 /** Resolve a positive float from a raw value, falling back to default. */
@@ -375,4 +390,11 @@ function validate(config: ProxyConfig): void {
     // defaultModel not in the models list — add it automatically
     config.models.push(config.defaultModel);
   }
+}
+
+/** Parse a comma-separated CORS allowlist from the env var. */
+function resolveCorsAllowList(raw: string | undefined): string[] | undefined {
+  if (!raw || raw.trim().length === 0) return undefined;
+  const list = raw.split(",").map(s => s.trim()).filter(Boolean);
+  return list.length > 0 ? list : undefined;
 }

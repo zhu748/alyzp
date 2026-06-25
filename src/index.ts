@@ -13,10 +13,21 @@ import { readZCodeImport } from "./auth/zcode-config.js";
 import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 
-const VERSION = "ceshi0.1.4";
+// Read version from package.json so it's maintained in a single place.
+// Bun's bundler inlines this at compile time — no runtime file I/O.
+const VERSION: string = (() => {
+  try {
+    // Resolve relative to the source file location for portability
+    const pkgPath = join(dirname(import.meta.dir ?? "."), "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
@@ -287,15 +298,9 @@ async function serve(configPath?: string): Promise<void> {
   console.error = (...args: unknown[]) => { origError(...args); safeAppend("error", 3, args); };
   console.warn = (...args: unknown[]) => { origWarn(...args); safeAppend("warn", 2, args); };
 
-  // CORS allowlist: comma-separated list of allowed origins. When set, the
-  // proxy only echoes `Access-Control-Allow-Origin` for origins in this list
-  // (prevents arbitrary websites from issuing authenticated cross-origin
-  // requests through the proxy). When unset, preserves the legacy permissive
-  // behavior (echo any origin) for backwards compatibility.
-  const corsAllowList = process.env.ZCODE_PROXY_CORS_ALLOWLIST;
-  if (corsAllowList) {
-    (globalThis as any).__ZCODE_PROXY_CORS_ALLOWLIST__ = corsAllowList.split(",").map(s => s.trim()).filter(Boolean);
-  }
+  // CORS allowlist is now loaded via config.corsAllowList (resolved from
+  // ZCODE_PROXY_CORS_ALLOWLIST env var in loadConfig) and passed through
+  // dependency injection — no more globalThis hack.
 
   const server = startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;

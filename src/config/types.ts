@@ -164,6 +164,13 @@ export interface ProxyConfig {
   server: {
     port: number;
     host: string;
+    /**
+     * Upstream request timeout in milliseconds. If an upstream request takes
+     * longer than this, it is aborted and a 504 Gateway Timeout is returned.
+     * Set to 0 to disable (not recommended — a hung upstream connection would
+     * leak resources indefinitely). Default: 300000 (5 minutes).
+     */
+    upstreamTimeoutMs?: number;
   };
   auth: AuthConfig;
   /** Active upstream provider. */
@@ -179,6 +186,29 @@ export interface ProxyConfig {
   defaultModel: string;
   /** Whitelist of allowed model ids. */
   models: string[];
+  /**
+   * Force-enable streaming for Anthropic-format requests.
+   *
+   * When true, the proxy overrides `stream: false` (or missing stream field)
+   * in Anthropic `/v1/messages` requests to `stream: true` before forwarding
+   * upstream. This lets clients that default to non-streaming (e.g. some
+   * Claude Code configurations) receive SSE responses instead of waiting for
+   * the full batch response — providing real-time token-by-token output.
+   *
+   * OpenAI and Responses API formats are unaffected (they already default to
+   * streaming in most clients). Only applies to the Anthropic passthrough path.
+   *
+   * Default: false (preserve original client's stream preference).
+   */
+  forceStreamAnthropic?: boolean;
+  /**
+   * CORS origin allowlist. When set, only origins in this list receive
+   * `Access-Control-Allow-Origin` headers. When empty/unset, any origin
+   * is allowed (legacy permissive behavior for backwards compatibility).
+   *
+   * Set via env var `ZCODE_PROXY_CORS_ALLOWLIST` (comma-separated).
+   */
+  corsAllowList?: string[];
   /**
    * Identity headers injected upstream. Always present after `loadConfig`;
    * defaults mirror the production ZCode desktop client.
