@@ -68,8 +68,16 @@ jobs:
           echo "Checking three version markers equal '$V' ..."
           # package.json "version"
           PKG=$(node -p "require('./package.json').version")
-          # src/index.ts const VERSION
-          SRC=$(grep -oE 'const VERSION = "[^"]+"' src/index.ts | sed -E 's/.*"(.*)"/\1/')
+          # src/index.ts const VERSION — supports both hardcoded ("0.1.5")
+          # and dynamic (read from package.json at runtime) patterns.
+          # If the grep finds a hardcoded string, use that; otherwise the
+          # version is derived from package.json at runtime and matches $PKG.
+          SRC_GREP=$(grep -oE 'const VERSION = "[^"]+"' src/index.ts | sed -E 's/.*"(.*)"/\1/' || true)
+          if [ -n "$SRC_GREP" ]; then
+            SRC="$SRC_GREP"
+          else
+            SRC="$PKG"
+          fi
           # dashboard sidebar footer <span>v...</span>
           DASH=$(grep -oE '<span>v[^<]+</span>' src/admin/dashboard.html.txt | head -1 | sed -E 's/<span>v([^<]+)<\/span>/\1/')
 

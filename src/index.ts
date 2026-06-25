@@ -13,21 +13,9 @@ import { readZCodeImport } from "./auth/zcode-config.js";
 import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
 
-// Read version from package.json so it's maintained in a single place.
-// Bun's bundler inlines this at compile time — no runtime file I/O.
-const VERSION: string = (() => {
-  try {
-    // Resolve relative to the source file location for portability
-    const pkgPath = join(dirname(import.meta.dir ?? "."), "package.json");
-    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-    return pkg.version ?? "0.0.0";
-  } catch {
-    return "0.0.0";
-  }
-})();
+const VERSION = "0.1.5";
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
