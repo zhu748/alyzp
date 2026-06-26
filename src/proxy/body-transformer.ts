@@ -168,11 +168,22 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
       modified = relocateSystemMessages(obj) || modified;
     }
     modified = stripThinkingBlocksFromMessages(obj) || modified;
-    modified = ensureAssistantTextBlock(obj) || modified;
+    // alignZCodeFormat: skip ensureAssistantTextBlock — real ZCode client
+    // allows assistant messages with only tool_use blocks (no text). Sample
+    // shows 18 such messages in real ZCode traffic. Inserting a placeholder
+    // text:" " block creates a fingerprint mismatch.
+    if (!ctx.alignZCodeFormat) {
+      modified = ensureAssistantTextBlock(obj) || modified;
+    }
     modified = normalizeAllMessageContent(obj) || modified;
-    modified = normalizeToolResultContent(obj) || modified;
-    modified = sanitizeContentBlocks(obj, ctx.startPlan) || modified;
-    modified = applyAnthropicCacheControl(obj, ctx.startPlan) || modified;
+    // alignZCodeFormat: skip normalizeToolResultContent — real ZCode client
+    // sends tool_result.content as STRING (49/49 in sample). Converting to
+    // array creates a fingerprint mismatch.
+    if (!ctx.alignZCodeFormat) {
+      modified = normalizeToolResultContent(obj) || modified;
+    }
+    modified = sanitizeContentBlocks(obj, ctx.startPlan, ctx.alignZCodeFormat) || modified;
+    modified = applyAnthropicCacheControl(obj, ctx.startPlan, ctx.alignZCodeFormat) || modified;
     // start-plan: ZCode gateway is stricter than official Anthropic API and
     // rejects `metadata.user_id` (returns 200 + empty SSE stream — invisible
     // to the SSE error detector, surfaces as "empty/malformed response" in
@@ -241,11 +252,19 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * from non-text blocks (coding-plan) or ALL blocks (start-plan), so even if this
  * function somehow attached to a disallowed block, sanitize would catch it.
  */
-function applyAnthropicCacheControl(body: Record<string, unknown>, startPlan?: boolean): boolean {
-  // In start-plan mode, do NOT add any cache_control. The ZCode gateway is
-  // stricter than Anthropic's official API and rejects cache_control on ALL
-  // block types, including text blocks. Adding it would trigger 3001.
-  if (startPlan) return false;
+function applyAnthropicCacheControl(
+  body: Record<string, unknown>,
+  startPlan?: boolean,
+  alignZCodeFormat?: boolean,
+): boolean {
+  // In start-plan mode WITHOUT alignZCodeFormat, do NOT add any cache_control.
+  // The ZCode gateway is stricter than Anthropic's official API and rejects
+  // cache_control on ALL block types, including text blocks.
+  //
+  // In alignZCodeFormat mode (regardless of start-plan), real ZCode client
+  // DOES send cache_control on the last user message's text block — we mirror
+  // that. sanitizeContentBlocks is also told to preserve cc in this mode.
+  if (startPlan && !alignZCodeFormat) return false;
   const messages = body.messages;
   if (!Array.isArray(messages) || messages.length === 0) return false;
 
@@ -841,7 +860,11 @@ function ensureAssistantTextBlock(body: Record<string, unknown>): boolean {
  *   - v2.1.3.9beta0: strip cache_control from text too in start-plan;
  *                    strip is_error from tool_result in both modes
  */
-function sanitizeContentBlocks(body: Record<string, unknown>, startPlan?: boolean): boolean {
+function sanitizeContentBlocks(
+  body: Record<string, unknown>,
+  startPlan?: boolean,
+  alignZCodeFormat?: boolean,
+): boolean {
   const messages = body.messages;
   if (!Array.isArray(messages)) return false;
 
@@ -856,19 +879,30 @@ function sanitizeContentBlocks(body: Record<string, unknown>, startPlan?: boolea
 
       // cache_control stripping — see function header for mode logic.
       if ("cache_control" in block) {
-        const shouldStrip = startPlan
-          ? true // start-plan: strip from ALL blocks (including text)
-          : block.type !== "text"; // coding-plan: strip from non-text only
+        let shouldStrip: boolean;
+        if (alignZCodeFormat) {
+          // alignZCodeFormat: NEVER strip cache_control. Real ZCode client
+          // keeps cache_control on the last user message's text block
+          // (sample: messages[122].content[3] role=user type=text).
+          // Stripping it removes the client's prompt-cache breakpoint,
+          // hurting cache hit rate AND creating a fingerprint mismatch.
+          shouldStrip = false;
+        } else if (startPlan) {
+          shouldStrip = true; // start-plan: strip from ALL blocks (including text)
+        } else {
+          shouldStrip = block.type !== "text"; // coding-plan: strip from non-text only
+        }
         if (shouldStrip) {
           delete block.cache_control;
           changed = true;
         }
       }
 
-      // is_error stripping on tool_result blocks (both modes).
-      // ZCode gateway doesn't accept this field — it's Claude Code metadata
-      // that the upstream doesn't need.
-      if (block.type === "tool_result" && "is_error" in block) {
+      // is_error stripping on tool_result blocks.
+      // alignZCodeFormat: KEEP is_error — real ZCode client preserves it
+      // (sample: messages[6].content[0] has is_error=true on a timeout result).
+      // Non-align modes: strip (ZCode gateway doesn't accept this field — 3001).
+      if (!alignZCodeFormat && block.type === "tool_result" && "is_error" in block) {
         delete block.is_error;
         changed = true;
       }
@@ -987,19 +1021,31 @@ function normalizeAllMessageContent(body: Record<string, unknown>): boolean {
  * ~5ms on a 90KB body for the common case of repeated identical requests.
  */
 function applyStartPlanSystem(body: Record<string, unknown>): boolean {
-  const newSystem = buildStartPlanSystem(body.system);
-  // Quick structural check: same length + same first-block text means the
-  // official blocks were already prepended (by us on a previous transform,
-  // or by the client mimicking the gateway format). Skip the reassignment
-  // entirely so transformRequestBodyObj doesn't flag the body as modified.
+  // Idempotency check: if `body.system` already starts with the official
+  // ZCode blocks (e.g. on retry/replay where a previous transform already
+  // injected them), DON'T re-inject. buildStartPlanSystem() would otherwise
+  // concatenate official blocks + the user blocks (which themselves now
+  // contain the official blocks), producing [official, official, client...]
+  // — a 5-block system instead of 3-block.
+  //
+  // Detection: walk the first N=official_blocks positions of cur and check
+  // each text matches. If all match, the official prefix is already there.
   const cur = body.system;
-  if (Array.isArray(cur) && cur.length === newSystem.length) {
-    const curFirst = cur[0] as { text?: string } | undefined;
-    const newFirst = newSystem[0] as { text?: string } | undefined;
-    if (curFirst && newFirst && curFirst.text === newFirst.text) {
+  const officialTexts = ZCODE_SYSTEM_BLOCKS.map(b => b.text);
+  if (Array.isArray(cur) && cur.length >= officialTexts.length) {
+    let alreadyInjected = true;
+    for (let i = 0; i < officialTexts.length; i++) {
+      const c = cur[i] as { text?: string } | undefined;
+      if (!c || c.text !== officialTexts[i]) {
+        alreadyInjected = false;
+        break;
+      }
+    }
+    if (alreadyInjected) {
       return false;
     }
   }
+  const newSystem = buildStartPlanSystem(body.system);
   body.system = newSystem;
   return true;
 }

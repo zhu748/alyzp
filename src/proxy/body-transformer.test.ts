@@ -2007,3 +2007,217 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     expect(parsed.system[2].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 });
+
+describe("transformRequestBody — alignZCodeFormat (message body fingerprint alignment, vceshi0.1.6+)", () => {
+  it("does NOT convert tool_result.content from string to array (real ZCode sends string)", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "run the tests" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "bun test" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "532 pass\n0 fail" }] },
+      ],
+      tools: [{ name: "Bash", description: "shell", input_schema: {} }],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const parsed = JSON.parse(out as string);
+    // tool_result.content should STILL be a string — real ZCode client sends string
+    const tr = parsed.messages[2].content[0];
+    expect(tr.type).toBe("tool_result");
+    expect(typeof tr.content).toBe("string");
+    expect(tr.content).toBe("532 pass\n0 fail");
+  });
+
+  it("does NOT insert placeholder text block into assistant messages with only tool_use", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "what files are here" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Glob", input: { pattern: "*" } }] },
+        { role: "user", content: "thanks" },
+      ],
+      tools: [{ name: "Glob", description: "find files", input_schema: {} }],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const parsed = JSON.parse(out as string);
+    // assistant message should STILL have only the tool_use block — no inserted text:" "
+    const asst = parsed.messages[1];
+    expect(asst.role).toBe("assistant");
+    expect(Array.isArray(asst.content)).toBe(true);
+    expect(asst.content.length).toBe(1);
+    expect(asst.content[0].type).toBe("tool_use");
+  });
+
+  it("preserves is_error on tool_result blocks (real ZCode keeps it)", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "run something that fails" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "exit 1" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "command failed", is_error: true }] },
+      ],
+      tools: [{ name: "Bash", description: "shell", input_schema: {} }],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const parsed = JSON.parse(out as string);
+    const tr = parsed.messages[2].content[0];
+    expect(tr.type).toBe("tool_result");
+    expect(tr.is_error).toBe(true); // preserved, not stripped
+  });
+
+  it("preserves client's cache_control in messages (does NOT strip)", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: [{ type: "text", text: "cached prefix", cache_control: { type: "ephemeral" } }] },
+        { role: "user", content: "next question" },
+      ],
+      tools: [],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    const parsed = JSON.parse(out as string);
+    // The client's cache_control on messages[0].content[0] should be preserved
+    expect(parsed.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("injects cache_control on last user message's text block (mirrors real ZCode)", () => {
+    // Real ZCode sample: messages[122].content[3] (role=user, type=text) has cc.
+    // Claude Code doesn't always add cc, so the proxy should add it on the
+    // last non-system message's last text block — same as coding-plan behavior.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: [{ type: "text", text: "reply" }] },
+        { role: "user", content: [{ type: "text", text: "last question" }] },
+      ],
+    });
+    // startPlan + alignZCodeFormat: cc should STILL be added (was no-op before fix)
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    const parsed = JSON.parse(out as string);
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+    expect(Array.isArray(lastUser.content)).toBe(true);
+    const lastBlock = lastUser.content[lastUser.content.length - 1];
+    expect(lastBlock.type).toBe("text");
+    expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("applyStartPlanSystem is idempotent under alignZCodeFormat + start-plan (no double-injection)", () => {
+    // Reproduces the vceshi0.1.5 bug: when alignZCodeFormat + startPlan are
+    // both on AND the body already has ZCode blocks in system (e.g. retry),
+    // applyStartPlanSystem used to inject another copy, producing 5 blocks
+    // instead of 3 (ZCode, ZCode, ZCode, ZCode, client).
+    //
+    // Use the EXACT official block texts (a real retry would carry the exact
+    // bytes injected by a prior transform — partial matches don't happen).
+    const zcodeBlock0 = "You are ZCode, an interactive coding agent";
+    const zcodeBlock1 = "\nYou are an interactive ZCode agent that helps users with software engineering tasks.\n\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\n\n# Harness\n- Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\n- Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.\n- `<system-reminder>` tags in messages and tool results are injected by the harness, not the user. Hooks may intercept tool calls; treat hook output as user feedback.\n- Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\n- Reference code as `file_path:line_number` — it's clickable.";
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: "hi" }],
+      // System already has 2 ZCode blocks + 1 client block (from a prior transform)
+      system: [
+        { type: "text", text: zcodeBlock0, cache_control: { type: "ephemeral" } },
+        { type: "text", text: zcodeBlock1, cache_control: { type: "ephemeral" } },
+        { type: "text", text: "client instructions" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true, startPlan: true });
+    const parsed = JSON.parse(out as string);
+    // Should be 3 blocks (2 ZCode + 1 client), NOT 5
+    expect(parsed.system.length).toBe(3);
+    expect(parsed.system[0].text).toBe(zcodeBlock0);
+    expect(parsed.system[2].text).toBe("client instructions");
+  });
+
+  it("full alignment: ClaudeCode long-task body matches real ZCode wire format", () => {
+    // Integration test mirroring the captured samples: a multi-turn ClaudeCode
+    // request with tool_use/tool_result should produce output matching the
+    // real ZCode client's wire format on every dimension that WAF inspects.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 32000,
+      thinking: { type: "adaptive" },
+      messages: [
+        { role: "user", content: "explore the repo" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Glob", input: { pattern: "**/*.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "src/index.ts\nsrc/foo.ts", is_error: false }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "Bash", input: { cmd: "wc -l src/index.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "command timed out", is_error: true }] },
+        { role: "assistant", content: [{ type: "text", text: "let me retry" }] },
+        { role: "user", content: "go ahead" },
+      ],
+      system: [
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      ],
+      tools: [
+        { name: "Glob", description: "find files", input_schema: {} },
+        { name: "Bash", description: "shell", input_schema: {} },
+      ],
+      metadata: { user_id: "device-abc" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic", alignZCodeFormat: true });
+    const parsed = JSON.parse(out as string);
+    const keys = Object.keys(parsed);
+
+    // 1. Top-level key order matches ZCode exactly
+    expect(keys).toEqual([
+      "model", "max_tokens", "thinking", "output_config",
+      "system", "messages", "tools", "tool_choice", "stream",
+    ]);
+
+    // 2. tool_result.content stayed as STRING (not converted to array)
+    const tr1 = parsed.messages[2].content[0];
+    expect(tr1.type).toBe("tool_result");
+    expect(typeof tr1.content).toBe("string");
+    const tr2 = parsed.messages[4].content[0];
+    expect(tr2.type).toBe("tool_result");
+    expect(typeof tr2.content).toBe("string");
+
+    // 3. is_error preserved on the failed tool_result
+    expect(tr2.is_error).toBe(true);
+    // Successful tool_result: is_error: false was sent by client → preserved too
+    expect(tr1.is_error).toBe(false);
+
+    // 4. Assistant message with only tool_use is NOT given a placeholder text block
+    const asst1 = parsed.messages[1];
+    expect(asst1.role).toBe("assistant");
+    expect(asst1.content.every((b: any) => b.type === "tool_use")).toBe(true);
+
+    // 5. cache_control added on last user message's text block (prompt cache breakpoint)
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+    const lastBlock = lastUser.content[lastUser.content.length - 1];
+    expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
+
+    // 6. metadata dropped (real ZCode never sends it)
+    expect(parsed.metadata).toBeUndefined();
+
+    // 7. system: 2 ZCode blocks + client block (with identity rewritten)
+    expect(parsed.system.length).toBe(3);
+    expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
+    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
+
+    // 8. thinking simplified + budget injected; max_tokens=64000; output_config injected
+    expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+    expect(parsed.max_tokens).toBe(64000);
+    expect(parsed.output_config).toEqual({ effort: "max" });
+
+    // 9. tool_choice + stream filled
+    expect(parsed.tool_choice).toEqual({ type: "auto" });
+    expect(parsed.stream).toBe(true);
+  });
+});

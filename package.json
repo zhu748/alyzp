@@ -1,6 +1,6 @@
 {
   "name": "zcode-proxy",
-  "version": "ceshi0.1.5",
+  "version": "ceshi0.1.6",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",

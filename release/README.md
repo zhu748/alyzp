@@ -1,5 +1,49 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.1.6 — 测试版本：消息体内部指纹全面对齐真实 ZCode 客户端（alignZCodeFormat 开关）**
+>
+> 在 vceshi0.1.5 顶层结构对齐的基础上，继续对齐 messages 内部的细节指纹。用真实 ClaudeCode 长任务请求（123 轮对话 + 49 个 tool_use/tool_result）做样本模拟，对比真实 ZCode 客户端抓包，本次修复后所有 WAF 可观测维度全部对齐。539/539 测试通过，TypeScript 编译零错误。
+>
+> **本次修复（仅在 alignZCodeFormat 开关开启时生效；默认关闭时行为与 v0.1.5 完全一致）**
+>
+> 1. **tool_result.content 保留 string 格式**：真实 ZCode 客户端的 `tool_result.content` 全部用 string（49/49），vceshi0.1.5 错误地转成了 array 格式。现在 alignZCodeFormat 模式下跳过 `normalizeToolResultContent`，保持 string 不变。
+>
+> 2. **assistant 消息不再强插 text 占位块**：真实 ZCode 客户端允许 assistant 消息只有 tool_use 块（样本中 18 条这样的消息），vceshi0.1.5 的 `ensureAssistantTextBlock` 强行插入 `text:" "` 占位块。现在 alignZCodeFormat 模式下跳过此步骤。
+>
+> 3. **保留 is_error 字段**：真实 ZCode 客户端保留 `tool_result.is_error`（样本 messages[6] 的超时返回有 `is_error: true`），vceshi0.1.5 在 `sanitizeContentBlocks` 里把 `is_error` 全部删了。现在 alignZCodeFormat 模式下保留。
+>
+> 4. **保留 + 注入 cache_control**：真实 ZCode 客户端在最后一条 user 消息的 text 块加 `cache_control: { type: "ephemeral" }` 作为 prompt cache 断点。vceshi0.1.5 在 start-plan 模式下被 `sanitizeContentBlocks` 全删了。现在 alignZCodeFormat 模式下：
+>    - 不剥离客户端自带的 cc
+>    - `applyAnthropicCacheControl` 即使在 start-plan 也启用，在最后一条 user 消息的末尾 text 块注入 cc
+>    - 既对齐指纹，又保留 prompt cache 优化（命中缓存输入 token 计费降到 1/10，TTFB 显著降低）
+>
+> 5. **修复 start-plan + alignZCodeFormat 双开时的幂等性 bug**：vceshi0.1.5 在重试/缓存回放场景下，`applyStartPlanSystem` 会重复注入 ZCode 官方块导致 system 从 3 块变成 5 块。现在改为完整比对官方块序列（前 N 块文本逐一匹配），不再重复注入。
+>
+> **实测对齐效果**（用 Claude Code 真实长任务请求做样本模拟，对比真实 ZCode 抓包）：
+>
+> | 维度 | vceshi0.1.5 | vceshi0.1.6 | 真实 ZCode |
+> |---|---|---|---|
+> | 顶层 9 字段顺序 | ✅ | ✅ | ✅ |
+> | `tool_result.content` 格式 | ❌ array | ✅ string (49/49) | string (49/49) |
+> | assistant 无 text 块 | ❌ 0（被强插） | ✅ 18 | 18 |
+> | `is_error` 保留 | ❌ 0（被删） | ✅ 1 | 1 |
+> | `cache_control` 块数 (start-plan) | ❌ 0（被剥） | ✅ 1 | 1 |
+> | system 块数 (start-plan 幂等) | ❌ 5（重复） | ✅ 3 | 3 |
+> | ZCode 官方 2 条 system 块 | ✅ | ✅ | ✅ |
+> | `tools` 15 个名称+顺序 | ✅ | ✅ | ✅ |
+> | metadata 剥离 | ✅ | ✅ | ✅ |
+>
+> **三种开启方式（不变）**：
+> 1. Dashboard「代理规则」→ 勾选「对齐 ZCode 请求格式（测试开关）」→ 保存（热切换，无需重启）
+> 2. YAML: `anthropic: alignZCodeFormat: true`
+> 3. 环境变量: `ZCODE_PROXY_ALIGN_ZCODE_FORMAT=1`
+>
+> **默认关闭时行为与 v0.1.5 完全一致**——所有新行为都在 `if (ctx.alignZCodeFormat)` 闭包内，关闭时走原有逻辑（normalizeToolResultContent 转 array、ensureAssistantTextBlock 强插 text、sanitizeContentBlocks 剥 cc+is_error、applyAnthropicCacheControl start-plan no-op）。
+>
+> **继承 vceshi0.1.5 / v0.1.8 的所有改动**（顶层字段顺序对齐、ZCode 官方 system 块注入、身份改写、请求头指纹对齐、思考格式默认注入、WAF 拦截短路检测、[undefined] 字段清理等）
+>
+> ---
+
 > **vceshi0.1.5 — 测试版本：请求体结构对齐真实 ZCode 客户端（alignZCodeFormat 开关）**
 >
 > 本次测试版本新增「对齐 ZCode 请求格式」开关（默认关闭），开启后请求体结构完全对齐真实 ZCode 桌面客户端抓包。全套 532/532 测试通过，TypeScript 编译零错误。
