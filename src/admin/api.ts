@@ -596,6 +596,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
       if (newConfig.forceStreamAnthropic !== undefined) opts.config.forceStreamAnthropic = newConfig.forceStreamAnthropic;
       if (newConfig.alignZCodeFormat !== undefined) opts.config.alignZCodeFormat = newConfig.alignZCodeFormat;
+      if (newConfig.thinkingLevel !== undefined) opts.config.thinkingLevel = newConfig.thinkingLevel === "high" ? "high" : "max";
       if (authBody) opts.config.auth = newConfig.auth;
       // providers.*.anthropicBase / openaiBase: also hot-swappable
       if (body.providers) {
@@ -608,7 +609,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "forceStreamAnthropic", "alignZCodeFormat", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "forceStreamAnthropic", "alignZCodeFormat", "thinkingLevel", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -2026,6 +2027,7 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     responsesThinking: config.responsesThinking ?? { models: [] },
     forceStreamAnthropic: config.forceStreamAnthropic === true,
     alignZCodeFormat: config.alignZCodeFormat === true,
+    thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
   };
 }
 
@@ -2085,6 +2087,9 @@ function configToYaml(config: ProxyConfig): string {
     anthropic: {
       ...(config.forceStreamAnthropic ? { forceStream: true } : {}),
       ...(config.alignZCodeFormat ? { alignZCodeFormat: true } : {}),
+      // Always persist thinkingLevel so users can see/change it in YAML.
+      // Default "max" mirrors real ZCode desktop client's max tier.
+      thinkingLevel: config.thinkingLevel === "high" ? "high" : "max",
     },
   };
 

@@ -1260,7 +1260,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.1.6</span>
+        <span>vceshi0.1.7</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1547,8 +1547,12 @@ td input{font-family:var(--font-mono)}
                 <div class="form-help">开启后，对 Anthropic 格式（/v1/messages）的请求强制设置 stream:true，即使客户端发送的是非流式请求。这使得 Claude Code 等默认非流式的客户端也能实时逐 token 输出，而不是等待完整响应。仅影响 Anthropic 直通路径，OpenAI / Responses 格式不受影响。默认关闭（保持客户端原始 stream 设置）。也可通过环境变量 ZCODE_PROXY_FORCE_STREAM_ANTHROPIC=1 开启。</div>
               </div>
               <div class="form-group">
-                <label class="form-label">ZCode 思考格式注入（默认开启）</label>
-                <div class="form-help" style="padding-top:6px">任何带 thinking.type=enabled 的 Anthropic 请求都会被自动改写成真实 ZCode 桌面客户端发送的格式：max_tokens=64000、thinking.budget_tokens=32000、output_config.effort=max。这是默认行为，无需配置，让请求体在 WAF 内容检查层与真实客户端无法区分。</div>
+                <label class="form-label">ZCode 思考等级</label>
+                <select id="cfgThinkingLevel" class="form-control" style="width:auto;min-width:160px">
+                  <option value="max">最高（budget_tokens=32000，effort=max）</option>
+                  <option value="high">高（budget_tokens=16000，effort=high）</option>
+                </select>
+                <div class="form-help" style="padding-top:6px">控制开启思考时注入的 ZCode 档位。客户端发送 <code class="code-inline">thinking.type=enabled</code> 时按此档位改写：<strong>最高</strong> → max_tokens=64000 / budget_tokens=32000 / effort=max；<strong>高</strong> → max_tokens=64000 / budget_tokens=16000 / effort=high。客户端不发 thinking 字段时只注入 max_tokens=64000，不强制开思考（对应 ZCode「不思考」模式）。默认「最高」（与真实 ZCode 客户端 max 档位一致）。</div>
               </div>
               <div class="form-group">
                 <label class="form-label">对齐 ZCode 请求格式（测试开关）</label>
@@ -2470,6 +2474,7 @@ async function loadSettings(){
     document.getElementById('cfgDebugLog').checked=!!c.logging?.debug;
     document.getElementById('cfgForceStreamAnthropic').checked=!!c.forceStreamAnthropic;
     document.getElementById('cfgAlignZCodeFormat').checked=!!c.alignZCodeFormat;
+    document.getElementById('cfgThinkingLevel').value=(c.thinkingLevel==='high'?'high':'max');
   }catch(e){console.error('loadSettings failed:',e);toast('加载设置失败','error')}
 }
 async function saveSettings(){
@@ -2533,7 +2538,8 @@ async function saveSettings(){
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value,verbose:document.getElementById('cfgVerboseLog').checked,debug:document.getElementById('cfgDebugLog').checked},
     forceStreamAnthropic:document.getElementById('cfgForceStreamAnthropic').checked,
-    alignZCodeFormat:document.getElementById('cfgAlignZCodeFormat').checked
+    alignZCodeFormat:document.getElementById('cfgAlignZCodeFormat').checked,
+    thinkingLevel:document.getElementById('cfgThinkingLevel').value==='high'?'high':'max'
   };
   const apiKey=document.getElementById('cfgApiKey').value;
   const proxyApiKey=document.getElementById('cfgProxyApiKey').value;

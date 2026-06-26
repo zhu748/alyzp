@@ -626,7 +626,11 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
         expect(req.headers.get("authorization")).toBe("Bearer jwt-mock");
         const reqBody = JSON.parse(await req.text());
         expect(reqBody.messages).toBeDefined();
-        expect(reqBody.max_tokens).toBe(4096);
+        // vceshi0.1.7+: injectZCodeThinkingFormat forces max_tokens=64000
+        // on all Anthropic-format requests (matches ZCode's wire shape,
+        // regardless of thinking on/off). The OpenAI→Anthropic translator
+        // originally sets 4096, but the body-transformer overrides it.
+        expect(reqBody.max_tokens).toBe(64000);
         return new Response(JSON.stringify({
           id: "msg_sp",
           type: "message",

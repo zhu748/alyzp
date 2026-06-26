@@ -103,6 +103,15 @@ export interface TransformContext {
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
   /**
+   * ZCode thinking tier — controls the budget_tokens + effort injected when
+   * the client sends `thinking.type=enabled`.
+   *   - "max"  (default): budget_tokens=32000, effort="max"
+   *   - "high"          : budget_tokens=16000, effort="high"
+   * When the client does NOT send `thinking`, only max_tokens=64000 is
+   * injected (ZCode "no thinking" wire shape) — thinking is never forced on.
+   */
+  thinkingLevel?: "high" | "max";
+  /**
    * When true, restructure the request body to match the real ZCode desktop
    * client's wire format exactly:
    *   - Top-level field order: model → max_tokens → thinking → output_config → system → messages → tools → tool_choice → stream
@@ -160,7 +169,11 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // Runs AFTER transformUnsupportedAnthropicFields so we can detect the
     // simplified `thinking: { type: "enabled" }` shape. Must run BEFORE
     // any transform that might strip output_config.
-    modified = injectZCodeThinkingFormat(obj) || modified;
+    //
+    // vceshi0.1.7+: thinkingLevel controls the tier (high/max). When client
+    // doesn't send `thinking`, only max_tokens=64000 is injected (ZCode "no
+    // thinking" mode) — thinking is NOT forced on.
+    modified = injectZCodeThinkingFormat(obj, ctx.thinkingLevel ?? "max") || modified;
     // When alignZCodeFormat is ON, skip relocateSystemMessages — real ZCode
     // keeps role: "system" inside messages[] instead of moving to top-level
     // system field. The align function (called last) handles system injection.
@@ -361,62 +374,79 @@ function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boo
 /**
  * Inject the EXACT thinking-format fields the real ZCode desktop client sends.
  *
- * Triggered only when `ctx.injectThinkingFormat === true`. When the request
- * has `thinking.type === "enabled"` (after transformUnsupportedAnthropicFields
- * simplified it), overwrite the thinking-related fields with the values the
- * real ZCode client sends:
+ * Runs UNCONDITIONALLY on every Anthropic request. Behavior depends on whether
+ * the client sent a `thinking` field and which `thinkingLevel` tier is selected:
  *
- *   - `max_tokens: 64000`           — force max output budget
- *   - `thinking.budget_tokens: 32000` — force thinking budget
- *   - `output_config: { effort: "max" }` — force max effort (re-added here
- *     because transformUnsupportedAnthropicFields strips it; the real ZCode
- *     client always sends it, so injecting it back aligns our fingerprint)
+ *   1. Client sent `thinking.type === "enabled"`:
+ *      Inject the tier-specific values:
+ *        - "max"  (default): max_tokens=64000, budget_tokens=32000, effort="max"
+ *        - "high"          : max_tokens=64000, budget_tokens=16000, effort="high"
+ *      These match the two thinking tiers the real ZCode desktop client offers
+ *      to users (高 / 最高).
+ *
+ *   2. Client did NOT send `thinking`, or sent `thinking.type !== "enabled"`
+ *      (e.g. "disabled"):
+ *      Only force `max_tokens=64000`. Do NOT add `thinking` or `output_config`.
+ *      This mirrors ZCode's "不思考" wire shape — the client never sends a
+ *      thinking field at all in that mode.
+ *
+ *      We DO NOT force thinking on. If the user wants thinking, they enable it
+ *      on the client side (Claude Code, Cherry Studio, etc.) — the dashboard
+ *      tier selector only controls high vs max intensity, not on/off.
  *
  * Source: reverse-engineered from real ZCode Electron client traffic (2026-06).
- * Captured request body shape:
- *   {
- *     "model": "glm-5.2",
- *     "max_tokens": 64000,
- *     "thinking": { "type": "enabled", "budget_tokens": 32000 },
- *     "output_config": { "effort": "max" },
- *     ...
- *   }
+ * Three observed wire shapes:
+ *   - max tier:    { max_tokens: 64000, thinking: { type: "enabled", budget_tokens: 32000 }, output_config: { effort: "max" } }
+ *   - high tier:   { max_tokens: 64000, thinking: { type: "enabled", budget_tokens: 16000 }, output_config: { effort: "high" } }
+ *   - no thinking: { max_tokens: 64000 }   (no thinking field, no output_config field)
  *
- * When `thinking` is absent or `type !== "enabled"`, this function is a no-op
- * — we don't force-enable thinking, we only align the format when the client
- * already requested thinking.
+ * Runs AFTER transformUnsupportedAnthropicFields so we can detect the simplified
+ * `thinking: { type: "enabled" }` shape. Must run BEFORE any transform that
+ * might strip output_config.
  */
-function injectZCodeThinkingFormat(body: Record<string, unknown>): boolean {
-  // Only inject when thinking is enabled. We don't force-enable thinking —
-  // that's a separate concern (see responsesThinking config for /v1/responses).
+function injectZCodeThinkingFormat(body: Record<string, unknown>, level: "high" | "max" = "max"): boolean {
   const thinking = body.thinking;
-  if (!isPlainObject(thinking)) return false;
-  if (thinking.type !== "enabled") return false;
+  const isThinkingEnabled = isPlainObject(thinking) && (thinking as Record<string, unknown>).type === "enabled";
 
   let changed = false;
 
-  // 1. Force max_tokens to 64000 (real ZCode client value).
-  //    The real client always sends 64000 when thinking is enabled, regardless
-  //    of what the user configured. Aligning this reduces fingerprinting risk.
+  // === Always force max_tokens=64000 (matches all 3 ZCode wire shapes) ===
   if (body.max_tokens !== 64000) {
     body.max_tokens = 64000;
     changed = true;
   }
 
-  // 2. Force thinking.budget_tokens to 32000 (real ZCode client value).
+  if (!isThinkingEnabled) {
+    // ZCode "不思考" mode: max_tokens already set above, no thinking field,
+    // no output_config. Make sure no leftover output_config from a prior
+    // transform step sneaks through (transformUnsupportedAnthropicFields
+    // already deletes it, but be defensive).
+    if ("output_config" in body) {
+      delete body.output_config;
+      changed = true;
+    }
+    return changed;
+  }
+
+  // === Thinking enabled: inject tier-specific values ===
+  const t = thinking as Record<string, unknown>;
+  const budgetTokens = level === "high" ? 16000 : 32000;
+  const effort = level === "high" ? "high" : "max";
+
+  // 1. Force thinking.budget_tokens to the tier value.
   //    transformUnsupportedAnthropicFields strips budget_tokens (GLM "doesn't
   //    support" it — but the real ZCode client sends it anyway and the gateway
   //    accepts it). We re-add it here to match the real client's shape.
-  if (thinking.budget_tokens !== 32000) {
-    thinking.budget_tokens = 32000;
+  if (t.budget_tokens !== budgetTokens) {
+    t.budget_tokens = budgetTokens;
     changed = true;
   }
 
-  // 3. Re-add output_config: { effort: "max" } (real ZCode client value).
+  // 2. Re-add output_config: { effort: <tier> }.
   //    transformUnsupportedAnthropicFields deletes this; we add it back. The
   //    real ZCode client always sends it when thinking is enabled.
-  if (!isPlainObject(body.output_config) || (body.output_config as Record<string, unknown>).effort !== "max") {
-    body.output_config = { effort: "max" };
+  if (!isPlainObject(body.output_config) || (body.output_config as Record<string, unknown>).effort !== effort) {
+    body.output_config = { effort };
     changed = true;
   }
 

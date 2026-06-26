@@ -1,5 +1,40 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.1.7 — 测试版本：新增思考等级面板控制（高 / 最高）**
+>
+> 在 vceshi0.1.6 的基础上，新增「ZCode 思考等级」面板下拉，支持两档思考强度，与真实 ZCode 桌面客户端的「高 / 最高」选项一一对应。同时移除了 v0.1.9 遗留的「ZCode 思考格式注入（默认开启）」固定说明文字（既然已默认开启，没必要在面板占一行）。547/547 测试通过，TypeScript 编译零错误。
+>
+> **本次新增功能 — thinkingLevel 配置项（默认 max）**
+>
+> Dashboard「代理规则」面板新增下拉：
+> - **最高**（默认）：`max_tokens=64000` / `thinking.budget_tokens=32000` / `output_config.effort=max`
+> - **高**：`max_tokens=64000` / `thinking.budget_tokens=16000` / `output_config.effort=high`
+>
+> 这两档参数完全对齐真实 ZCode 桌面客户端的思考档位选项。
+>
+> **触发逻辑**（关键设计）：
+>
+> | 客户端请求 | 代理行为 |
+> |---|---|
+> | 客户端发送 `thinking.type=enabled` | 按面板档位注入 `budget_tokens` + `output_config.effort`（高或最高） |
+> | 客户端不发 `thinking` 字段 | 只注入 `max_tokens=64000`，**不强制开思考**（对应 ZCode「不思考」模式） |
+> | 客户端发送 `thinking.type=disabled` | 同上：只注入 `max_tokens=64000`，保留 `thinking.type=disabled` 不变 |
+>
+> 也就是说：**面板档位只控制思考强度（高 vs 最高），不控制思考开关**。开关由客户端决定——Claude Code / Cherry Studio 等客户端在用户那边开思考，代理才会按面板档位注入对应强度。
+>
+> **三种配置方式**：
+> 1. Dashboard「代理规则」→ 「ZCode 思考等级」下拉 → 选「最高」或「高」→ 保存（热切换，无需重启）
+> 2. YAML: `anthropic: thinkingLevel: high` 或 `anthropic: thinkingLevel: max`
+> 3. 环境变量: `ZCODE_PROXY_THINKING_LEVEL=high` 或 `ZCODE_PROXY_THINKING_LEVEL=max`
+>
+> **其他改动**：
+> - 移除 dashboard 里 v0.1.9 遗留的「ZCode 思考格式注入（默认开启）」纯文字说明（既然默认就是开的，没必要单独占一行面板；改为下拉控件更实用）
+> - `injectZCodeThinkingFormat` 重写：默认情况下 `max_tokens=64000` 强制注入（匹配 ZCode 三种 wire 形态都有 `max_tokens=64000`）；只有当 `thinking.type=enabled` 时才注入 `budget_tokens` + `output_config`
+>
+> **继承 vceshi0.1.6 / vceshi0.1.5 / v0.1.8 的所有改动**（消息体内部指纹对齐、顶层字段顺序对齐、ZCode 官方 system 块注入、身份改写、请求头指纹对齐、WAF 拦截短路检测、[undefined] 字段清理等）
+>
+> ---
+
 > **vceshi0.1.6 — 测试版本：消息体内部指纹全面对齐真实 ZCode 客户端（alignZCodeFormat 开关）**
 >
 > 在 vceshi0.1.5 顶层结构对齐的基础上，继续对齐 messages 内部的细节指纹。用真实 ClaudeCode 长任务请求（123 轮对话 + 49 个 tool_use/tool_result）做样本模拟，对比真实 ZCode 客户端抓包，本次修复后所有 WAF 可观测维度全部对齐。539/539 测试通过，TypeScript 编译零错误。

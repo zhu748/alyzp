@@ -166,6 +166,18 @@ export function loadConfig(path: string): ProxyConfig {
   const alignZCodeFormat = process.env.ZCODE_PROXY_ALIGN_ZCODE_FORMAT === "1"
     || parsed?.anthropic?.alignZCodeFormat === true;
 
+  // --- ZCode thinking level (controls budget_tokens + effort when thinking enabled) ---
+  // Two tiers mirror real ZCode desktop client:
+  //   "max"  (default): max_tokens=64000, budget_tokens=32000, effort="max"
+  //   "high"          : max_tokens=64000, budget_tokens=16000, effort="high"
+  // When client doesn't send `thinking`, only max_tokens=64000 is injected
+  // (ZCode "no thinking" mode) — proxy never forces thinking on.
+  // Env var: ZCODE_PROXY_THINKING_LEVEL=high|max
+  const thinkingLevelEnv = process.env.ZCODE_PROXY_THINKING_LEVEL;
+  const thinkingLevel: "high" | "max" = thinkingLevelEnv === "high" || parsed?.anthropic?.thinkingLevel === "high"
+    ? "high"
+    : "max";
+
   const config: ProxyConfig = {
     server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -176,6 +188,7 @@ export function loadConfig(path: string): ProxyConfig {
     models,
     forceStreamAnthropic,
     alignZCodeFormat,
+    thinkingLevel,
     corsAllowList,
     identity,
     logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging },
