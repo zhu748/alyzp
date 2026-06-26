@@ -69,7 +69,10 @@ import type { AsyncMutex } from "../utils/fs.js";
 const CAPTCHA_HEADER = "x-aliyun-captcha-verify-param";
 const REGION_HEADER = "x-aliyun-captcha-verify-region";
 const CONFIGS_API = "https://zcode.z.ai/api/v1/client/configs";
-const TOKEN_TTL_MS = 45_000;
+// v0.1.6+: TOKEN_TTL_MS no longer used (no token cache). Kept as a comment
+// for documentation — Aliyun verifyParam is valid for ~45s upstream, but
+// we solve fresh each time so TTL doesn't matter to us.
+// const TOKEN_TTL_MS = 45_000;
 const FAKE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /** How many times to retry a single captcha solve. Overridable via env. */
@@ -78,48 +81,41 @@ const SOLVE_RETRIES = Number(process.env.ZCODE_CAPTCHA_RETRIES || 3);
 const SOLVE_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_TIMEOUT_MS || 40_000);
 /** Timeout (ms) waiting for the SDK to expose `initAliyunCaptcha`. */
 const SDK_LOAD_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_SDK_LOAD_MS || 20_000);
-/** Config-fetch timeout (ms). The configs API is fast; 8s is generous. */
-const CONFIG_FETCH_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS || 8_000);
+/** Config-fetch timeout (ms). The configs API is fast; 15s is generous
+ *  for slow networks. Overridable via env. */
+const CONFIG_FETCH_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS || 15_000);
 
 interface FetchedCaptchaConfig { enabled: boolean; prefix: string; sceneId: string; region: string; }
 let cachedConfig: { value: FetchedCaptchaConfig | null; expiresAt: number } = { value: null, expiresAt: 0 };
-let cachedToken: { verifyParam: string; region: string; expiresAt: number } | null = null;
 
 /**
- * In-flight solve guard. Set to true while a JSDOM solve is running.
- * getCaptchaToken checks this AFTER acquiring the mutex to decide whether
- * to start a new solve or piggyback on the cached result.
+ * v0.1.6+ FIX: NO token cache.
  *
- * Mutated only under solveMutex — no race possible.
+ * Aliyun captcha verifyParam is ONE-SHOT — zcode.z.ai consumes it on first
+ * verification. If two concurrent requests share the same cached token,
+ * the second request gets `{"code":3007,"msg":"captcha verify failed"}`.
  *
- * v0.1.5+ NOTE: this flag is currently informational (logged but not
- * acted on, because the mutex + double-checked-locking already prevents
- * redundant solves). Kept for future use — e.g. an `invalidateCaptchaToken()`
- * called mid-solve could check this flag to abort the in-flight solve
- * via AbortController, instead of waiting for it to finish and then
- * discarding the result. For now, `pendingInvalidate` covers that case.
+ * The previous v0.1.5 cache + the mutex double-checked-locking I added
+ * made this worse: concurrent cache-miss callers would all get the SAME
+ * token (first solves, rest hit cache). This caused 3007 errors.
+ *
+ * New design:
+ *   - getCaptchaToken() ALWAYS solves a fresh token (no cache)
+ *   - solveMutex serializes solves so only ONE JSDOM exists at a time
+ *     (prevents OOM from N concurrent JSDOM instances)
+ *   - handler.ts caches the token PER-REQUEST (retry reuses, 403 re-solves)
+ *
+ * This means concurrent requests each get their own token (safe), at the
+ * cost of serialized solve latency (N requests = N × ~20s solve time).
+ * For a single-user local proxy this is acceptable — concurrent
+ * start-plan requests are rare.
  */
-let solveInFlight = false;
-// Mark as "used" so the linter doesn't strip it — the flag is part of
-// the public debugging surface (logs reference it).
-void solveInFlight;
-
-/**
- * Pending-invalidate flag. Set by invalidateCaptchaToken() when a solve
- * is currently in flight. The in-flight solve's result will be discarded
- * (not cached) so the next getCaptchaToken() call starts fresh.
- *
- * Mutated under solveMutex for the set; the read happens inside the
- * critical section that captures the result, also under the mutex.
- */
-let pendingInvalidate = false;
 
 /**
  * Mutex serializing captcha solves. Ensures only ONE JSDOM exists at a time.
  * Solves take 10-40s; concurrent solves would each spawn a JSDOM (50-100MB
  * each) → OOM under load. With the mutex, the second+ caller waits for the
- * first to finish, then either reuses the cached result (if the first
- * succeeded) or starts its own solve (if the first failed).
+ * first to finish, then starts its own solve (NOT sharing the result).
  *
  * The mutex is module-level (singleton) so all callers share the same lock.
  */
@@ -131,22 +127,15 @@ export function detectCaptchaChallenge(resp: Response): string | null {
 }
 
 /**
- * Invalidate the cached captcha token. The NEXT getCaptchaToken() call will
- * re-solve from scratch.
- *
- * If a solve is currently in flight, sets a flag so that solve's result is
- * discarded — otherwise the stale result would land in the cache and be
- * used despite the invalidate (defeating the purpose of invalidating after
- * a 403 "captcha verify failed" response).
+ * Invalidate any cached captcha token. With the v0.1.6+ no-cache design,
+ * this is effectively a no-op (there's nothing to invalidate) — but kept
+ * for API compatibility with handler.ts which calls it on 403 responses.
  *
  * Safe to call multiple times in quick succession (idempotent).
  */
 export function invalidateCaptchaToken(): void {
-  cachedToken = null;
-  // If a solve is in flight, mark it for discard. The mutex ensures the
-  // solve's "should I cache this result?" check happens-after this set
-  // (the check is inside solveMutex.run).
-  pendingInvalidate = true;
+  // No-op: we don't cache tokens anymore. Each getCaptchaToken() call
+  // solves fresh. Handler.ts's per-request cache is cleared separately.
 }
 
 async function fetchCaptchaConfig(): Promise<FetchedCaptchaConfig | null> {
@@ -174,29 +163,21 @@ async function fetchCaptchaConfig(): Promise<FetchedCaptchaConfig | null> {
 }
 
 /**
- * Get a captcha token, solving if necessary. Serialized via solveMutex so
- * only one JSDOM exists at a time. After acquiring the mutex, re-checks the
- * cache (double-checked locking) — the first caller may have solved it
- * while we were waiting.
+ * Get a FRESH captcha token. Always solves — no cache (see module header
+ * for why: Aliyun verifyParam is one-shot, sharing causes 3007 errors).
+ *
+ * Serialized via solveMutex so only one JSDOM exists at a time (prevents
+ * OOM from N concurrent JSDOM instances, each 50-100MB).
+ *
+ * handler.ts is responsible for caching the token PER-REQUEST (so retries
+ * within the same request reuse the token, but different requests get
+ * different tokens).
  *
  * @throws Error if the config is unavailable OR all solve retries fail.
  *         Callers (handler.ts) catch this and return 503 to the client.
  */
 export async function getCaptchaToken(): Promise<{ verifyParam: string; region: string }> {
-  // Fast path: cache hit, no lock needed (cachedToken is monomorphically
-  // assigned in the mutex, reads outside are safe in single-threaded JS).
-  if (cachedToken && cachedToken.expiresAt > Date.now()) {
-    return { verifyParam: cachedToken.verifyParam, region: cachedToken.region };
-  }
-
-  // Slow path: serialize. Only one caller at a time solves; the rest wait
-  // and benefit from the cached result.
   return solveMutex.run(async () => {
-    // Double-check after acquiring the lock — the first caller solved it.
-    if (cachedToken && cachedToken.expiresAt > Date.now() && !pendingInvalidate) {
-      return { verifyParam: cachedToken.verifyParam, region: cachedToken.region };
-    }
-
     const cfg = await fetchCaptchaConfig();
     if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) {
       // Hard failure — config unavailable. Throwing here means retry attempts
@@ -208,26 +189,8 @@ export async function getCaptchaToken(): Promise<{ verifyParam: string; region: 
       );
     }
 
-    // Reset the pending-invalidate flag now that we're starting a fresh solve.
-    pendingInvalidate = false;
-    solveInFlight = true;
-    try {
-      const verifyParam = await solveInJsdomWithRetry(cfg);
-      // Re-check pendingInvalidate — a 403 invalidate may have arrived
-      // during our solve. If so, discard the result (don't cache) so the
-      // next call starts fresh.
-      if (pendingInvalidate) {
-        console.log("[captcha] solve completed but pendingInvalidate set — discarding result, next call will re-solve");
-        pendingInvalidate = false;
-        // Still return the result to THIS caller — it's valid for ~45s,
-        // the invalidate is about not poisoning the cache for OTHER callers.
-        return { verifyParam, region: cfg.region };
-      }
-      cachedToken = { verifyParam, region: cfg.region, expiresAt: Date.now() + TOKEN_TTL_MS };
-      return { verifyParam, region: cfg.region };
-    } finally {
-      solveInFlight = false;
-    }
+    const verifyParam = await solveInJsdomWithRetry(cfg);
+    return { verifyParam, region: cfg.region };
   });
 }
 
@@ -270,8 +233,23 @@ async function solveInJsdom(cfg: FetchedCaptchaConfig): Promise<string> {
   const vc = new VirtualConsole();
   // Silence the SDK's verbose console.log noise — we only care about
   // errors, which surface via the reject path.
+  // v0.1.6+: also silence the `vm.runInContext` TypeError that jsdom
+  // throws on Bun (Bun's vm module is incomplete). These errors are
+  // non-fatal — the SDK has fallback paths and solve still succeeds.
+  // Logging them floods the dashboard with scary-looking errors that
+  // don't actually break anything.
   vc.on("jsdomError", (err: Error) => {
-    console.error(`[captcha] jsdomError: ${err.message}`);
+    const msg = err.message ?? "";
+    // Silence known-non-fatal jsdom errors on Bun:
+    //   - "undefined is not an object (evaluating 'vm.runInContext...')"
+    //     → Bun's vm module doesn't expose runInContext; jsdom's script
+    //       execution falls back to eval, which works for the SDK.
+    //   - "Not implemented: HTMLCanvasElement.prototype.getContext"
+    //     → we polyfill this, but some code paths still hit the native one
+    if (/vm\.runInContext|Not implemented:/i.test(msg)) {
+      return; // suppress
+    }
+    console.error(`[captcha] jsdomError: ${msg}`);
   });
 
   const sdkSafe = ALIYUN_SDK_LOCAL.replace(/<\/script>/gi, "<\\/script>");

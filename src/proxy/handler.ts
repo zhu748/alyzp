@@ -222,6 +222,25 @@ export async function proxyRequest(
   }
 
   let captchaHeaders: Record<string, string> | undefined;
+  // v0.1.8+ EVERY FETCH GETS A FRESH TOKEN.
+  //
+  // Aliyun verifyParam is consumed on EVERY upstream response — not just on
+  // 403 captcha failure. Even a successful 200 / 529 / 429 response consumes
+  // the token. Reusing the same token on retry → 403 "captcha verify failed"
+  // (code 3007).
+  //
+  // v0.1.7 had a per-request cache that reused the token on 529 retries,
+  // assuming "529 means captcha passed". WRONG — zcode.z.ai consumes the
+  // token regardless of the response status. This caused 3007 errors on
+  // every retry after the first attempt.
+  //
+  // v0.1.8 fix: NO per-request cache. Every fetchUpstreamDetected() call
+  // solves a fresh token. This adds ~20-40s per retry (JSDOM solve time),
+  // but it's the only correct behavior given Aliyun's one-shot semantics.
+  //
+  // handleCaptchaChallenge() is kept as a fast-path for 403 (re-solve +
+  // immediate retry without waiting for the next loop iteration), but it
+  // no longer caches the result.
   if (currentPlan === "start-plan") {
     try {
       const token = await getCaptchaToken();
@@ -336,18 +355,18 @@ export async function proxyRequest(
     return resp;
   };
 
-  // Refresh captcha token if we're in start-plan mode. Returns the captcha
-  // headers to use, or undefined if not in start-plan / refresh failed.
-  // Called before EVERY fetch attempt (initial + retries) to avoid using a
-  // stale token that expired during the retry backoff window.
+  // Get a FRESH captcha token for every fetch attempt. No cache.
   //
-  // Token TTL is 45s; the first request might wait 1-8s on retry backoff,
-  // and the upstream might take another few seconds to respond — easily
-  // pushing us past the 45s mark. Using a stale token returns 403
-  // "captcha verify failed" which then leaks through to the client.
+  // v0.1.8+: Aliyun verifyParam is consumed on EVERY upstream response (200,
+  // 529, 429, 403 — all of them). Reusing a token on retry → 3007 error.
+  // So every call to refreshCaptchaHeaders() solves a fresh token.
   //
-  // getCaptchaToken() internally caches for TOKEN_TTL_MS (45s), so calling
-  // it on every retry is cheap — only re-solves when the cache expires.
+  // This adds ~20-40s per retry (JSDOM solve time), but it's mandatory.
+  // The solveMutex in captcha.ts serializes solves so only one JSDOM
+  // exists at a time (prevents OOM).
+  //
+  // Called before EVERY fetch attempt (initial + retries). The mutex
+  // ensures concurrent requests solve sequentially, not in parallel.
   const refreshCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
     if (currentPlan !== "start-plan") return undefined;
     try {
@@ -358,15 +377,19 @@ export async function proxyRequest(
     }
   };
 
-  // Handle a 403 captcha challenge by invalidating the cached token,
-  // re-solving, and retrying the fetch with the fresh token.
-  // Returns the new response, or the original 403 if re-solve fails.
+  // Handle a 403 captcha challenge by re-solving and retrying with a fresh
+  // token. Returns the new response, or a synthetic 503 if re-solve fails.
   // Used both for the initial fetch AND for retry-loop fetches — without
   // this, a retry that returns 403 would leak through to the client.
+  //
+  // v0.1.8+: NO per-request cache. The re-solved token is used only for
+  // this single fetch — the next retry will solve again via
+  // refreshCaptchaHeaders(). This is intentional: Aliyun tokens are
+  // one-shot, caching them invites 3007 errors.
   const handleCaptchaChallenge = async (resp: Response): Promise<Response> => {
     try { resp.body?.cancel(); } catch {}
     console.log(`${reqId} captcha challenge (403), re-solving...`);
-    invalidateCaptchaToken();
+    invalidateCaptchaToken(); // no-op in v0.1.8+, kept for API compat
     try {
       const fresh = await getCaptchaToken();
       console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);

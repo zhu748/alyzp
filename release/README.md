@@ -1,5 +1,32 @@
 # zcode-proxy 使用说明
 
+> **v0.1.7 — 紧急修复：Captcha Token 重用导致 3007 验证失败**
+>
+> 本次修复 v0.1.6 引入的 regression。全套 508/508 测试通过，TypeScript 编译零错误，生产编译成功。
+>
+> **问题：v0.1.6 的 mutex + double-checked-locking 导致 captcha token 在并发请求间共享**
+> - 症状：start-plan 模式下，多个并发请求共享同一个 Aliyun captcha verifyParam token，第二个请求上游返回 `{"code":3007,"msg":"captcha verify failed"}`
+> - 根因：v0.1.6 加的 `solveMutex` + double-checked locking 让并发 cache-miss 的请求都拿到**同一个** token（第一个 solve 完，其他 cache hit 复用）。但 Aliyun verifyParam 是**一次性**的，zcode.z.ai 验证一次后即消耗
+>
+> **修复（captcha.ts）**
+> - **完全去掉 token cache**，`getCaptchaToken()` 每次都 solve 新的 token
+> - 保留 `solveMutex` 串行 solve 防止 OOM（同时只有一个 JSDOM 实例）
+> - config fetch timeout 从 8s → 15s，避免网络慢时误判 config 不可用
+> - 静默 jsdom 在 Bun 上的 `vm.runInContext` 错误（这些错误不影响 solve 成功，但会刷屏 dashboard 日志）
+>
+> **修复（handler.ts）—— 每次 fetch 都 solve 新 token**
+> - 关键认知：Aliyun verifyParam 在**任何**上游响应后都被消耗（200 / 529 / 429 / 403 都算），不只是 403 captcha 失败时才消耗
+> - 因此**每次** `fetchUpstreamDetected()` 调用前都 solve 一个全新的 token，不复用
+> - `handleCaptchaChallenge()` 保留作为 403 的快速重试路径，但 re-solve 的 token 也只用于这一次 fetch
+> - 代价：每次 retry 多 20-40s solve 时间（JSDOM 启动开销），但这是 Aliyun captcha 一次性语义的硬性要求
+> - 并发请求由 `solveMutex` 串行化，防止 N 个 JSDOM 实例同时存在导致 OOM
+>
+> **影响**
+> - 不同请求各自 solve 独立 token → 3007 错误消除
+> - 同一请求的 retry 也各自 solve 独立 token → 529 重试不再触发 3007
+> - 并发请求串行 solve（mutex 保护）→ 防止 OOM，代价是并发延迟（N 请求 = N × solve 时间）
+> - 对于单用户本地代理场景，并发 start-plan 请求很少，延迟可接受
+>
 > **v0.1.6 — 全面优化：Captcha 并发保护 + 凭证竞态修复 + Admin API 默认鉴权 + authExport 安全输出**
 >
 > 本次更新聚焦于「用着用着突然不能用」类问题的根因修复。全套 508/508 测试通过，TypeScript 编译零错误，生产编译（786 模块 → 单文件 exe）成功。
