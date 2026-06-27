@@ -15,7 +15,7 @@ import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 
-const VERSION = "0.2.0.1";
+const VERSION = "0.2.0.2";
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
@@ -231,7 +231,7 @@ async function serve(configPath?: string): Promise<void> {
   const origLog = console.log;
   const origError = console.error;
   const origWarn = console.warn;
-  const { appendLog } = await import("./admin/api.js");
+  const { appendLog, setLogFilePath } = await import("./admin/api.js");
 
   /**
    * Serialize a single console argument to a single string.
@@ -290,6 +290,11 @@ async function serve(configPath?: string): Promise<void> {
   console.log = (...args: unknown[]) => { origLog(...args); safeAppend("info", 1, args); };
   console.error = (...args: unknown[]) => { origError(...args); safeAppend("error", 3, args); };
   console.warn = (...args: unknown[]) => { origWarn(...args); safeAppend("warn", 2, args); };
+
+  // G3: File logging — if config.logging.file or ZCODE_PROXY_LOG_FILE is set,
+  // each log entry is also appended to the specified file as a JSON line.
+  const logFile = config.logging?.file || process.env.ZCODE_PROXY_LOG_FILE;
+  if (logFile) setLogFilePath(logFile);
 
   // CORS allowlist is now loaded via config.corsAllowList (resolved from
   // ZCODE_PROXY_CORS_ALLOWLIST env var in loadConfig) and passed through

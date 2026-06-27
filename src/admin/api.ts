@@ -58,13 +58,17 @@ const stats = {
   success: 0,
   failed: 0,
   retried: 0,
-  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens: string; retried?: boolean }>,
+  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens: string; captchaMs?: string; retried?: boolean }>,
   models: {} as Record<string, { count: number; avgTtfb: number; tokens: number; inputTokens: number }>,
   // vceshi0.0.6+: per-credential usage stats (in-memory, reset on restart).
   // Keyed by maskApiKey(apiKey) to avoid leaking plaintext keys in stats.
   // The dashboard joins this with listAccounts (which has apiKeyMask) to
   // display "使用次数" per account.
-  byCredential: {} as Record<string, { count: number; inputTokens: number; outputTokens: number; lastUsed: string }>,
+  byCredential: {} as Record<string, { count: number; inputTokens: number; outputTokens: number; lastUsed: string; success: number; failed: number }>,
+  // G5: Error stats by status code — enables the dashboard to show "529: 12, 429: 3"
+  // instead of just "failed: 15". Critical for diagnosing whether failures are
+  // overload (529), rate-limit (429), auth (401), or parameter errors (3001/400).
+  byStatus: {} as Record<number, number>,
 };
 const requestIndex = new Map<string, number>();
 const seenIds = new Set<string>();
@@ -82,7 +86,7 @@ const seenIds = new Set<string>();
  * - inputTokens: from upstream usage.input_tokens / prompt_tokens
  * - credentialKey: maskApiKey(cred.apiKey) for per-credential usage tracking
  */
-export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens?: string; credentialKey?: string; retried?: boolean }) {
+export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens?: string; credentialKey?: string; retried?: boolean; captchaMs?: string }) {
   const existingIdx = requestIndex.get(entry.id);
   if (existingIdx !== undefined) {
     // Update the existing entry — do NOT increment counters again.
@@ -93,6 +97,14 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
     if (wasSuccess !== isSuccess) {
       if (isSuccess) { stats.failed--; stats.success++; }
       else { stats.success--; stats.failed++; }
+    }
+    // G5: Update byStatus on re-classification
+    if (wasSuccess !== isSuccess) {
+      // Decrement the old status count (it's being re-classified)
+      stats.byStatus[old.status] = (stats.byStatus[old.status] ?? 1) - 1;
+      if (stats.byStatus[old.status] <= 0) delete stats.byStatus[old.status];
+      // Increment the new status count
+      stats.byStatus[entry.status] = (stats.byStatus[entry.status] ?? 0) + 1;
     }
     // Always count retry flag — the final entry wins.
     if (entry.retried && !old.retried) stats.retried++;
@@ -105,17 +117,26 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
     // because the original increment already happened (decrementing would
     // risk going negative on edge cases).
     if (!wasSuccess && isSuccess && entry.credentialKey) {
-      const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "" };
+      const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "", success: 0, failed: 0 };
       c.count++;
+      c.success++;
+      // Decrement the failed counter that was incremented on the original failed recordStat
+      c.failed = Math.max(0, (c.failed || 0) - 1);
       c.inputTokens += parseInt(entry.inputTokens ?? "0") || 0;
       c.outputTokens += parseInt(entry.tokens) || 0;
       c.lastUsed = entry.time;
       stats.byCredential[entry.credentialKey] = c;
     }
+    // G6: If re-classified from success to failure, track credential failure
+    if (wasSuccess && !isSuccess && entry.credentialKey) {
+      const c = stats.byCredential[entry.credentialKey];
+      if (c) { c.success--; c.failed++; }
+    }
     stats.requests[existingIdx] = {
       ...old,
       ...entry,
       inputTokens: entry.inputTokens ?? old.inputTokens ?? "0",
+      captchaMs: entry.captchaMs ?? old.captchaMs ?? "0",
       retried: entry.retried || old.retried,
     };
     return;
@@ -147,7 +168,9 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   if (entry.status >= 200 && entry.status < 300) stats.success++;
   else stats.failed++;
   if (entry.retried) stats.retried++;
-  const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0" };
+  // G5: Track by status code
+  stats.byStatus[entry.status] = (stats.byStatus[entry.status] ?? 0) + 1;
+  const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0", captchaMs: entry.captchaMs ?? "0" };
   stats.requests.push(fullEntry);
   requestIndex.set(entry.id, idx);
   // vceshi0.0.7+: track lifetime-seen ids to handle post-trim retries.
@@ -195,15 +218,21 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   }
 
   // vceshi0.0.6+: per-credential usage tracking (in-memory).
-  // Only count successful requests toward credential usage — failed requests
-  // didn't actually consume the credential's quota.
+  // G6: Now tracks both success AND failure counts per credential, enabling
+  // the dashboard to display success rates. Previously only successes were
+  // counted, making it impossible to identify credentials that are failing.
   // vceshi0.0.7+: no cap needed here — byCredential is keyed by maskApiKey
   // which is bounded by the number of stored accounts (typically < 20).
-  if (entry.credentialKey && entry.status >= 200 && entry.status < 300) {
-    const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "" };
-    c.count++;
-    c.inputTokens += parseInt(fullEntry.inputTokens) || 0;
-    c.outputTokens += parseInt(entry.tokens) || 0;
+  if (entry.credentialKey) {
+    const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "", success: 0, failed: 0 };
+    if (entry.status >= 200 && entry.status < 300) {
+      c.count++;
+      c.success++;
+      c.inputTokens += parseInt(fullEntry.inputTokens) || 0;
+      c.outputTokens += parseInt(entry.tokens) || 0;
+    } else {
+      c.failed++;
+    }
     c.lastUsed = entry.time;
     stats.byCredential[entry.credentialKey] = c;
   }
@@ -223,6 +252,7 @@ export function _resetStatsForTesting(): void {
   stats.requests = [];
   stats.models = {};
   stats.byCredential = {};
+  stats.byStatus = {};
   requestIndex.clear();
   seenIds.clear();
 }
@@ -367,10 +397,63 @@ const persistConfig = (config: ProxyConfig, configPath: string): Promise<void> =
 // stale whenever splice() ran — causing clients to miss logs or replay
 // old ones after a trim event.
 const LOG_BUFFER_SIZE = 2000;
-const LOG_BUFFER_TRIM = 1000; // trim to this size when capacity is reached
-const logBuffer: Array<{ seq: number; time: string; level: string; message: string }> = [];
+// G8: Ring buffer implementation — replaces the old splice-based approach.
+// splice(0, N) on a 2000-element array copies 1000 elements and is O(N).
+// A ring buffer avoids the copy entirely — push at the write cursor,
+// overwrite the oldest entry when full, and iterate via modulo arithmetic.
+// The logBuffer array is pre-allocated to LOG_BUFFER_SIZE to avoid resizing.
+const logBufferRing = new Array<{ seq: number; time: string; level: string; message: string } | null>(LOG_BUFFER_SIZE).fill(null);
+let logRingWrite = 0;  // next write position (wraps around)
+let logRingCount = 0;  // number of valid entries (0..LOG_BUFFER_SIZE)
 let logSeq = 0; // monotonic, never reset — used as client cursor
 const logWaiters: Array<{ resolve: (value: unknown) => void }> = [];
+
+// G3: File logging — when set, each log entry is also appended to this file.
+// Set via config.logging.file or env var ZCODE_PROXY_LOG_FILE.
+let logFilePath: string | undefined;
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+/**
+ * Set the file path for persistent log output. Called from index.ts after
+ * config is loaded. Each appendLog() call will also write the entry as a
+ * JSON line to this file. Set to undefined to disable file logging.
+ */
+export function setLogFilePath(path: string | undefined): void {
+  logFilePath = path;
+  if (path) {
+    // Ensure the parent directory exists
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+    } catch { /* may already exist */ }
+    appendLog("info", `File logging enabled: ${path}`);
+  }
+}
+
+/**
+ * Iterate over the ring buffer in order (oldest → newest).
+ * Yields only non-null entries. Used by SSE flush and batch endpoint.
+ */
+function* iterRingBuffer(): Generator<{ seq: number; time: string; level: string; message: string }> {
+  if (logRingCount === 0) return;
+  // If the buffer isn't full yet, start from index 0.
+  // If full, logRingWrite points to the OLDEST entry (next to be overwritten).
+  const start = logRingCount < LOG_BUFFER_SIZE ? 0 : logRingWrite;
+  for (let i = 0; i < logRingCount; i++) {
+    const idx = (start + i) % LOG_BUFFER_SIZE;
+    const entry = logBufferRing[idx];
+    if (entry) yield entry;
+  }
+}
+
+/**
+ * Get the first (oldest) entry in the ring buffer, or null if empty.
+ */
+function ringBufferFirst(): { seq: number; time: string; level: string; message: string } | null {
+  if (logRingCount === 0) return null;
+  const start = logRingCount < LOG_BUFFER_SIZE ? 0 : logRingWrite;
+  return logBufferRing[start];
+}
 
 /** Add a log entry to the buffer (called by intercepting console.log). */
 export function appendLog(level: string, message: string) {
@@ -390,10 +473,18 @@ export function appendLog(level: string, message: string) {
     level,
     message: message.slice(0, maxLen),
   };
-  logBuffer.push(entry);
-  if (logBuffer.length > LOG_BUFFER_SIZE) {
-    // Efficient: remove in bulk instead of one-by-one splice
-    logBuffer.splice(0, logBuffer.length - LOG_BUFFER_TRIM);
+  // Ring buffer write — overwrite oldest when full
+  logBufferRing[logRingWrite] = entry;
+  logRingWrite = (logRingWrite + 1) % LOG_BUFFER_SIZE;
+  if (logRingCount < LOG_BUFFER_SIZE) logRingCount++;
+  // G3: File logging — append entry as JSON line if file path is set.
+  // Uses appendFileSync for simplicity (one write per log entry, no buffering).
+  // On a busy server this could be a bottleneck; for a local proxy tool the
+  // write volume is typically <50 lines/sec which is fine for sync writes.
+  if (logFilePath) {
+    try {
+      appendFileSync(logFilePath, JSON.stringify(entry) + "\n");
+    } catch { /* never let file logging break the request */ }
   }
   // Push the new entry to every connected SSE client.
   //
@@ -1798,6 +1889,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     stats.requests = [];
     stats.models = {};
     stats.byCredential = {};
+    stats.byStatus = {};
     requestIndex.clear();
     seenIds.clear(); // vceshi0.0.7+: clear lifetime dedup set on manual reset
     appendLog("info", "Stats reset by admin");
@@ -1841,15 +1933,16 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         // Used by the safety-net polling interval only — push delivery goes
         // through waiter.resolve(entry) directly, no full buffer scan needed.
         const flushNew = () => {
-          for (const e of logBuffer) {
+          for (const e of iterRingBuffer()) {
             if (e.seq > lastSentSeq) send(e);
           }
           lastSentSeq = logSeq;
         };
 
         // Send existing buffered logs first.
-        const startSeq = logBuffer.length > 0 ? logBuffer[0].seq : logSeq + 1;
-        for (const entry of logBuffer) {
+        const first = ringBufferFirst();
+        const startSeq = first ? first.seq : logSeq + 1;
+        for (const entry of iterRingBuffer()) {
           if (entry.seq < startSeq) continue;
           send(entry);
         }
@@ -1956,10 +2049,10 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     const level = url.searchParams.get("level");
     const search = url.searchParams.get("search")?.toLowerCase();
     const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 2000);
-    let logs = logBuffer;
+    let logs = Array.from(iterRingBuffer());
     if (level) logs = logs.filter(l => l.level === level);
     if (search) logs = logs.filter(l => l.message.toLowerCase().includes(search));
-    return jsonResp({ logs: logs.slice(-limit), total: logBuffer.length });
+    return jsonResp({ logs: logs.slice(-limit), total: logRingCount });
   }
 
   // Get debug dumps (memory ring buffer of upstream 4xx transformed bodies).

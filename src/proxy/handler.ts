@@ -66,6 +66,15 @@ export async function proxyRequest(
   const started = Date.now();
   const reqId = nextReqId();
 
+  // G1: Request entry log — the FIRST log line for every request, appearing
+  // before any routing/transform/upstream log. Without this, the first log
+  // for a request appears at the routing stage, making it impossible to
+  // correlate "how long did the request wait before routing?" or "which
+  // reqId corresponds to this client request?".
+  const clientPath = new URL(clientReq.url).pathname;
+  const clientMethod = clientReq.method;
+  console.log(`${reqId} >>> ${clientMethod} ${clientPath} (${format})`);
+
   // Debug logging flag — when true, logs the full upstream response details
   // (status + key headers + body preview) for every request. Enabled via
   // config.logging.debug OR env var ZCODE_PROXY_DEBUG_LOGGING=1. This is the
@@ -75,6 +84,13 @@ export async function proxyRequest(
     || process.env.ZCODE_PROXY_DEBUG_LOGGING === "1";
 
   const body = await readBody(clientReq);
+
+  // G7: Log actual body size (more accurate than Content-Length header, which
+  // may be absent for chunked transfers or inaccurate for compressed bodies).
+  if (body && body.length > 0) {
+    const sizeKB = (body.length / 1024).toFixed(1);
+    console.log(`${reqId} body size: ${sizeKB}KB (${body.length} bytes)`);
+  }
 
   // Parse the body once and reuse the parsed object throughout the pipeline.
   // Previously the body string was JSON.parse'd up to 3 times (peekBody,
@@ -243,6 +259,11 @@ export async function proxyRequest(
   }
 
   let captchaHeaders: Record<string, string> | undefined;
+  // Track cumulative captcha solve time for this request (G4: TTFB split).
+  // Each captcha solve takes 20-40s; knowing how much of TTFB is captcha
+  // vs actual upstream latency is critical for diagnosing slow start-plan
+  // requests.
+  let totalCaptchaMs = 0;
   // v0.1.8+ EVERY FETCH GETS A FRESH TOKEN.
   //
   // Aliyun verifyParam is consumed on EVERY upstream response — not just on
@@ -264,7 +285,8 @@ export async function proxyRequest(
   // no longer caches the result.
   if (currentPlan === "start-plan") {
     try {
-      const token = await getCaptchaToken();
+      const token = await getCaptchaToken(reqId);
+      totalCaptchaMs += token.solveMs;
       captchaHeaders = { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
     } catch {
       // Will solve on 403 fallback below
@@ -391,7 +413,8 @@ export async function proxyRequest(
   const refreshCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
     if (currentPlan !== "start-plan") return undefined;
     try {
-      const token = await getCaptchaToken();
+      const token = await getCaptchaToken(reqId);
+      totalCaptchaMs += token.solveMs;
       return { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
     } catch {
       return undefined;
@@ -412,8 +435,9 @@ export async function proxyRequest(
     console.log(`${reqId} captcha challenge (403), re-solving...`);
     invalidateCaptchaToken(); // no-op in v0.1.8+, kept for API compat
     try {
-      const fresh = await getCaptchaToken();
-      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
+      const fresh = await getCaptchaToken(reqId);
+      totalCaptchaMs += fresh.solveMs;
+      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars, ${fresh.solveMs}ms), retrying...`);
       const freshCaptcha = {
         [RETRY_HEADERS.PARAM]: fresh.verifyParam,
         [RETRY_HEADERS.REGION]: fresh.region,
@@ -870,7 +894,7 @@ export async function proxyRequest(
       if (isSSE && upstreamResp.body) {
         const translated = anthropicSseToResponsesSse(upstreamResp.body, meta.model);
         const [clientBody, statsBody] = translated.tee();
-        observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey));
+        observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey), totalCaptchaMs);
         return translatedSseResponse(clientBody);
       }
       return await translatedResponsesBatchResponse(
@@ -878,21 +902,22 @@ export async function proxyRequest(
         (parsedBody as OpenAIResponseRequest | undefined)?.previous_response_id,
         (parsedBody as OpenAIResponseRequest | undefined)?.input,
         maskApiKey(cred.apiKey),
+        totalCaptchaMs,
       );
     }
     // Chat Completions translation: use the original SSE / batch translators.
     if (isSSE && upstreamResp.body) {
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
       const [clientBody, statsBody] = translated.tee();
-      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey));
+      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey), totalCaptchaMs);
       return translatedSseResponse(clientBody);
     }
-    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey));
+    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey), totalCaptchaMs);
   }
 
   if (isSSE && upstreamResp.body) {
     const [clientBody, statsBody] = upstreamResp.body.tee();
-    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey));
+    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey), totalCaptchaMs);
     return passthroughResponse(upstreamResp, clientBody);
   }
 
@@ -915,7 +940,7 @@ export async function proxyRequest(
       }
     } catch { /* non-JSON or parse error — leave as 0, fall back to original body */ }
   }
-  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, false, passthroughInputTokens, maskApiKey(cred.apiKey));
+  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, false, passthroughInputTokens, maskApiKey(cred.apiKey), totalCaptchaMs);
   // Reconstruct the response with the read body so passthrough still has content
   if (passthroughBody !== null) {
     return new Response(passthroughBody, {
@@ -1212,6 +1237,7 @@ async function translatedBatchResponse(
   started: number,
   headersAt: number,
   credKey?: string,
+  captchaMs: number = 0,
 ): Promise<Response> {
   const raw = await upstream.text();
   let parsedAnthropic: AnthropicMessagesResponse;
@@ -1237,7 +1263,7 @@ async function translatedBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
     // Note: Bun.gzipSync blocks the event loop briefly (~5-20ms for 200KB).
     // Bun's typing only exposes gzipSync (not an async Bun.gzip), and the
     // alternative (Bun.deflateSync with GZIP format) is also sync. In
@@ -1249,7 +1275,7 @@ async function translatedBatchResponse(
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -1286,6 +1312,7 @@ async function translatedResponsesBatchResponse(
   previousResponseId: string | undefined,
   clientInput: unknown,
   credKey?: string,
+  captchaMs: number = 0,
 ): Promise<Response> {
   const raw = await upstream.text();
   let parsedAnthropic: AnthropicMessagesResponse;
@@ -1318,13 +1345,13 @@ async function translatedResponsesBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
     return new Response(Bun.gzipSync(payload), {
       status: upstream.status,
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -1444,10 +1471,10 @@ function printHeader(): void {
   if (headerPrinted) return;
   headerPrinted = true;
   console.log(
-    "| #    | Time       | Fmt | Model       | Mode   | Stat |    TTFB |   Tok |  tok/s |   Total |",
+    "| #    | Time       | Fmt | Model       | Mode   | Stat |    TTFB | Captcha |   Tok |  tok/s |   Total |",
   );
   console.log(
-    "|------|------------|-----|-------------|--------|------|---------|-------|--------|---------|",
+    "|------|------------|-----|-------------|--------|------|---------|---------|-------|--------|---------|",
   );
 }
 
@@ -1464,30 +1491,42 @@ function printRow(
   retried: boolean = false,
   inputTokens: number = 0,
   credKey?: string,
+  captchaMs: number = 0,
 ): void {
   printHeader();
   const ts = new Date(started).toISOString().slice(11, 19);
   const tag = format === "anthropic" ? "ANT" : format === "openai-responses" ? "RSP" : "OAI";
   const mode = meta.stream ? "stream" : "batch";
-  const ttfb = `${headersAt - started}ms`;
+  const ttfbMs = headersAt - started;
+  const ttfb = `${ttfbMs}ms`;
+  const captcha = captchaMs > 0 ? `${captchaMs}ms` : "-";
   const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
   const tok = tokens > 0 ? String(tokens) : "-";
   const inTok = inputTokens > 0 ? String(inputTokens) : "-";
   const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
-  console.log(
-    `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | in:${inTok.padStart(5)} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
-  );
+  // When captcha took a significant portion of TTFB, show the breakdown
+  if (captchaMs > 0 && ttfbMs > 0) {
+    const netTtfb = ttfbMs - captchaMs;
+    console.log(
+      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inTok.padStart(5)} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
+    );
+  } else {
+    console.log(
+      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inTok.padStart(5)} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
+    );
+  }
   // Record stats for the admin dashboard
   recordStat({
     id: reqId,
     time: ts,
     model: meta.model,
     status,
-    ttfb: String(headersAt - started),
+    ttfb: String(ttfbMs),
     tokens: String(tokens),
     inputTokens: String(inputTokens),
     credentialKey: credKey,
     retried,
+    captchaMs: String(captchaMs),
   });
 }
 
@@ -1500,6 +1539,7 @@ function observeStream(
   body: ReadableStream<Uint8Array>,
   contentEncoding: string | null,
   credKey?: string,
+  captchaMs: number = 0,
 ): void {
   const compressed = contentEncoding !== null;
   let tokens = 0;
@@ -1574,7 +1614,7 @@ function observeStream(
     const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
     const totalMs = endAt - requestSentAt;
     const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
-    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey);
+    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey, captchaMs);
   })().catch(() => {});
 }
 

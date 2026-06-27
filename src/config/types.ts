@@ -248,6 +248,22 @@ export interface ProxyConfig {
      * startup. Also toggleable via dashboard "日志配置" tab (alongside verbose).
      */
     debug?: boolean;
+    /**
+     * Optional file logging — when set, log entries are also appended to this
+     * file path in addition to the in-memory ring buffer. Useful for long-running
+     * servers where the in-memory buffer is too small or gets lost on restart.
+     *
+     * The file is opened in append mode so it persists across restarts. Each line
+     * is a JSON object: {"seq":N,"time":"HH:MM:SS","level":"info","message":"..."}
+     *
+     * Default: undefined (file logging disabled). Set to a file path like
+     * "./logs/proxy.log" or "/var/log/zcode-proxy.log" to enable.
+     * Env var: ZCODE_PROXY_LOG_FILE to set at startup.
+     *
+     * IMPORTANT: This is a simple append-only log — no log rotation is built in.
+     * Use logrotate (Linux) or an external tool for rotation on production servers.
+     */
+    file?: string;
   };
   /**
    * Retry configuration for upstream requests.

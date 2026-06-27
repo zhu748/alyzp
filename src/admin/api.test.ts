@@ -17,6 +17,7 @@ import {
   recordStat,
   recordDebugDump,
   clearDebugDumps,
+  appendLog,
   _resetStatsForTesting,
   handleAdminRoute,
   type AdminOptions,
@@ -241,6 +242,128 @@ describe("recordStat — byCredential re-classification (vceshi0.0.7+)", () => {
     const body = await resp!.json();
     expect(body.byCredential["abc12345...wxyz"].count).toBe(1);
     expect(body.byCredential["abc12345...wxyz"].outputTokens).toBe(15);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recordStat — byStatus error breakdown + byCredential success/fail (logging G5+G6)
+// ---------------------------------------------------------------------------
+
+describe("recordStat — byStatus error breakdown (G5)", () => {
+  it("tracks error counts per status code", async () => {
+    recordStat({ id: "#s1", time: "10:00:00", model: "glm-4.6", status: 200, ttfb: "100", tokens: "5" });
+    recordStat({ id: "#s2", time: "10:00:01", model: "glm-4.6", status: 529, ttfb: "200", tokens: "0" });
+    recordStat({ id: "#s3", time: "10:00:02", model: "glm-4.6", status: 529, ttfb: "300", tokens: "0" });
+    recordStat({ id: "#s4", time: "10:00:03", model: "glm-4.6", status: 429, ttfb: "50", tokens: "0" });
+    recordStat({ id: "#s5", time: "10:00:04", model: "glm-4.6", status: 401, ttfb: "10", tokens: "0" });
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.byStatus[200]).toBe(1);
+    expect(body.byStatus[529]).toBe(2);
+    expect(body.byStatus[429]).toBe(1);
+    expect(body.byStatus[401]).toBe(1);
+  });
+
+  it("updates byStatus when a retry changes status (529→200)", async () => {
+    recordStat({ id: "#s6", time: "10:00:00", model: "glm-4.6", status: 529, ttfb: "100", tokens: "0" });
+    recordStat({ id: "#s6", time: "10:00:00", model: "glm-4.6", status: 200, ttfb: "200", tokens: "15", retried: true });
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    // 529 should be decremented (0 → removed), 200 should be 1
+    expect(body.byStatus[529] ?? 0).toBe(0);
+    expect(body.byStatus[200]).toBe(1);
+  });
+
+  it("resets byStatus on DELETE /admin/api/stats", async () => {
+    recordStat({ id: "#s7", time: "10:00:00", model: "glm-4.6", status: 529, ttfb: "100", tokens: "0" });
+    const opts = makeAdminOpts();
+    await callAdmin(authedReq("/admin/api/stats", { method: "DELETE" }), opts);
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.byStatus).toEqual({});
+  });
+});
+
+describe("recordStat — byCredential success/fail tracking (G6)", () => {
+  it("tracks success and failure counts per credential", async () => {
+    recordStat({ id: "#c1", time: "10:00:00", model: "glm-4.6", status: 200, ttfb: "100", tokens: "5", credentialKey: "key1...abcd" });
+    recordStat({ id: "#c2", time: "10:00:01", model: "glm-4.6", status: 529, ttfb: "200", tokens: "0", credentialKey: "key1...abcd" });
+    recordStat({ id: "#c3", time: "10:00:02", model: "glm-4.6", status: 200, ttfb: "150", tokens: "10", credentialKey: "key2...efgh" });
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.byCredential["key1...abcd"].success).toBe(1);
+    expect(body.byCredential["key1...abcd"].failed).toBe(1);
+    expect(body.byCredential["key1...abcd"].count).toBe(1); // only successful counted
+    expect(body.byCredential["key2...efgh"].success).toBe(1);
+    expect(body.byCredential["key2...efgh"].failed).toBe(0);
+  });
+
+  it("updates credential success/fail on re-classification (529→200)", async () => {
+    recordStat({ id: "#c4", time: "10:00:00", model: "glm-4.6", status: 529, ttfb: "100", tokens: "0", credentialKey: "key3...ijkl" });
+    recordStat({ id: "#c4", time: "10:00:00", model: "glm-4.6", status: 200, ttfb: "200", tokens: "15", credentialKey: "key3...ijkl", retried: true });
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.byCredential["key3...ijkl"].success).toBe(1);
+    expect(body.byCredential["key3...ijkl"].failed).toBe(0);
+    expect(body.byCredential["key3...ijkl"].count).toBe(1);
+  });
+});
+
+describe("recordStat — captchaMs field (G4)", () => {
+  it("records captchaMs in the request entry", async () => {
+    recordStat({ id: "#cap1", time: "10:00:00", model: "glm-4.6", status: 200, ttfb: "35000", tokens: "10", captchaMs: "32000" });
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.requests[body.requests.length - 1].captchaMs).toBe("32000");
+  });
+
+  it("defaults captchaMs to '0' when not provided", async () => {
+    recordStat({ id: "#cap2", time: "10:00:00", model: "glm-4.6", status: 200, ttfb: "150", tokens: "10" });
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.requests[body.requests.length - 1].captchaMs).toBe("0");
+  });
+});
+
+describe("ring buffer — log buffer (G8)", () => {
+  it("survives overfill beyond LOG_BUFFER_SIZE without splice", async () => {
+    // Push more entries than the buffer can hold — the ring buffer should
+    // silently overwrite the oldest without any splice/copy overhead.
+    for (let i = 0; i < 2500; i++) {
+      appendLog("info", `log entry ${i}`);
+    }
+    const opts = makeAdminOpts();
+    // Batch endpoint should return the last N entries
+    const resp = await callAdmin(authedReq("/admin/api/logs?limit=10"), opts);
+    const body = await resp!.json();
+    // Should have exactly 10 logs (limited by ?limit=10)
+    expect(body.logs.length).toBe(10);
+    // The most recent entries should be the last ones pushed
+    expect(body.logs[9].message).toBe("log entry 2499");
+    // Total should be the ring buffer count (capped at LOG_BUFFER_SIZE)
+    expect(body.total).toBeLessThanOrEqual(2000);
+  });
+
+  it("supports level filtering on the ring buffer", async () => {
+    appendLog("info", "info message");
+    appendLog("error", "error message");
+    appendLog("warn", "warn message");
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/logs?level=error"), opts);
+    const body = await resp!.json();
+    expect(body.logs.length).toBe(1);
+    expect(body.logs[0].message).toBe("error message");
+    expect(body.logs[0].level).toBe("error");
   });
 });
 

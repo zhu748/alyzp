@@ -152,6 +152,11 @@ export function loadConfig(path: string): ProxyConfig {
   const debugLogging = process.env.ZCODE_PROXY_DEBUG_LOGGING === "1"
     || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.debug === true);
 
+  // G3: File logging path — when set, log entries are also written to disk.
+  const logFile = (typeof (parsed as any)?.logging === "object" && typeof (parsed as any).logging?.file === "string")
+    ? (parsed as any).logging.file
+    : undefined;
+
   // --- CORS allowlist ---
   const corsAllowList = resolveCorsAllowList(process.env.ZCODE_PROXY_CORS_ALLOWLIST);
 
@@ -183,7 +188,7 @@ export function loadConfig(path: string): ProxyConfig {
     thinkingLevel,
     corsAllowList,
     identity,
-    logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging },
+    logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile },
     retry,
     routingRules,
     modelMappings,

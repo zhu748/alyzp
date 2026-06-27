@@ -138,8 +138,9 @@ export function invalidateCaptchaToken(): void {
   // solves fresh. Handler.ts's per-request cache is cleared separately.
 }
 
-async function fetchCaptchaConfig(): Promise<FetchedCaptchaConfig | null> {
+async function fetchCaptchaConfig(reqId?: string): Promise<FetchedCaptchaConfig | null> {
   if (cachedConfig.value && cachedConfig.expiresAt > Date.now()) return cachedConfig.value;
+  const tag = reqId ? `${reqId} ` : "";
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), CONFIG_FETCH_TIMEOUT_MS);
@@ -157,7 +158,7 @@ async function fetchCaptchaConfig(): Promise<FetchedCaptchaConfig | null> {
   } catch (err) {
     // Config fetch failure is unrecoverable — don't retry. The retry loop
     // in getCaptchaToken treats null-config as a hard failure.
-    console.warn(`[captcha] config fetch failed: ${(err as Error).message}`);
+    console.warn(`${tag}[captcha] config fetch failed: ${(err as Error).message}`);
     return null;
   }
 }
@@ -176,9 +177,11 @@ async function fetchCaptchaConfig(): Promise<FetchedCaptchaConfig | null> {
  * @throws Error if the config is unavailable OR all solve retries fail.
  *         Callers (handler.ts) catch this and return 503 to the client.
  */
-export async function getCaptchaToken(): Promise<{ verifyParam: string; region: string }> {
+export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: string; region: string; solveMs: number }> {
+  const tag = reqId ? `${reqId} ` : "";
+  const solveStart = Date.now();
   return solveMutex.run(async () => {
-    const cfg = await fetchCaptchaConfig();
+    const cfg = await fetchCaptchaConfig(reqId);
     if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) {
       // Hard failure — config unavailable. Throwing here means retry attempts
       // upstream won't help (the config won't suddenly appear), so handler.ts
@@ -189,8 +192,10 @@ export async function getCaptchaToken(): Promise<{ verifyParam: string; region: 
       );
     }
 
-    const verifyParam = await solveInJsdomWithRetry(cfg);
-    return { verifyParam, region: cfg.region };
+    const verifyParam = await solveInJsdomWithRetry(cfg, reqId);
+    const solveMs = Date.now() - solveStart;
+    console.log(`${tag}captcha solved in ${solveMs}ms`);
+    return { verifyParam, region: cfg.region, solveMs };
   });
 }
 
@@ -199,7 +204,8 @@ export async function getCaptchaToken(): Promise<{ verifyParam: string; region: 
  * (unrecoverable); only solve failures (SDK timeout, instance init error)
  * trigger the retry loop.
  */
-async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig): Promise<string> {
+async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string): Promise<string> {
+  const tag = reqId ? `${reqId} ` : "";
   let lastErr: Error | null = null;
   for (let attempt = 1; attempt <= SOLVE_RETRIES; attempt++) {
     try {
@@ -213,7 +219,7 @@ async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig): Promise<string>
       if (/config unavailable|disabled|empty config/i.test(msg)) {
         throw err;
       }
-      console.error(`[captcha] solve attempt ${attempt}/${SOLVE_RETRIES} failed: ${msg}`);
+      console.error(`${tag}[captcha] solve attempt ${attempt}/${SOLVE_RETRIES} failed: ${msg}`);
       // Brief backoff between retries — gives the SDK a chance to release
       // any lingering timers / event-loop work from the failed attempt.
       if (attempt < SOLVE_RETRIES) {
