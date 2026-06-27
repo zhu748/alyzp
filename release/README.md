@@ -1,5 +1,45 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.3 — 安全加固 + 协议转换 bug 修复**
+>
+> 本次发版聚焦于安全防护与协议转换正确性，修复了多个高危问题。
+>
+> **本次改动**
+>
+> **安全加固**
+>
+> 1. **修复 XFF 伪造绕过 admin 鉴权**：之前 admin API 通过 `X-Forwarded-For` / `X-Real-IP` 判断 loopback，但这些头任何客户端都可伪造，攻击者发送 `X-Real-IP: 127.0.0.1` 即可获得 admin 权限。现在改用 `Bun.server.requestIP(req)` 读取 TCP 真实远端地址（不可伪造），XFF 仅在 `server.trustProxy: true` 时可信（需在 config.yaml 显式开启，用于反向代理后端场景）。
+>
+> 2. **修复存储型 XSS**：dashboard 的内联 `onclick` 之前用 `escapeHtml` 转义字符串参数，但 HTML 解析器会把 `&#39;` 还原为 `'`，导致 JS 字符串可被闭合逃逸。新增 `escapeJsString()` 对 JS 字符串上下文做转义（含 `\`、`'`、`"`、`\n`、`\r`、`\u2028`、`\u2029`），所有内联 onclick 参数全部替换。
+>
+> 3. **修复 OAuth 回调 innerHTML XSS**：`d.provider` / `d.apiKeyMask` / `d.userId` / `d.error` / `d.message` 之前直接拼接到 innerHTML，可能被上游劫持注入。现在全部 `escapeHtml()`。
+>
+> 4. **新增安全响应头**：dashboard 和 admin API 响应统一加 `Content-Security-Policy` / `X-Frame-Options: DENY` / `X-Content-Type-Options: nosniff` / `Referrer-Policy: same-origin` / `Cache-Control: no-store`。
+>
+> 5. **admin /verify 失败计数锁定**：同一 IP 连续 10 次失败后 15 分钟内拒绝访问（429），防止暴力枚举 `proxyApiKey`。成功验证后清零。
+>
+> 6. **admin API 请求体大小限制**：所有 mutation 路由限制请求体 1 MiB，防止恶意 1GB JSON 触发 OOM。
+>
+> 7. **setAccountProxy URL 校验加固**：之前用松散的正则 `/^(https?|socks5h?):\/\/[^\s]+$/i`，允许单引号等特殊字符（直接导致存储型 XSS）。改用 `new URL()` 严格校验 + 拒绝 host 含 HTML/JS 元字符。
+>
+> 8. **CORS 默认收紧**：之前无 allowlist 时回显任意 Origin，现在默认回显 `"null"`（拒绝跨站），需要时通过 `ZCODE_PROXY_CORS_ALLOWLIST` 显式配置。
+>
+> **协议转换**
+>
+> 9. **修复 `tool_choice: "none"` 语义反转**：OpenAI 的 `"none"`（禁用工具调用）之前被翻译为 Anthropic 的 `{ type: "any" }`（强制调用工具），语义完全相反。现在正确丢弃 `tools` 数组和 `tool_choice`，让模型没有工具可调用。
+>
+> 10. **修复流式 `tool_use` 完全丢失**：`anthropicSseToOpenaiSse` 之前跳过 `content_block_start`，导致 OpenAI 客户端永远收不到 `tool_calls` 的 id/name/arguments，流式工具调用完全丢失。现在正确发出 OpenAI 格式的 `tool_calls` delta，支持多工具、text+tool 混合块、参数增量。
+>
+> **代理模块**
+>
+> 11. **修复 WAF body 消费后未恢复**：`isWafBlockResponse` 之前在非 WAF 路径用 `(resp as any)._wafCheckBody = text` hack 暂存 body，但下游从不读取，导致 200+HTML 响应的 `body.tee()` 抛错。重构为 `checkWafBlock` 返回新的 `Response`（body 重建），并在重试循环中也加入 WAF 检查。
+>
+> 12. **`upstreamTimeoutMs` 配置实际生效**：之前 `config.server.upstreamTimeoutMs` 被 loader 解析但 handler 用硬编码常量，配置是死的。现在 handler 读取配置值，0 或未设时回退到默认（流式 10min / 批量 5min）。
+>
+> 13. **`sessionCache` 指纹改用 socket IP**：之前 `clientFingerprint` 无条件读 XFF，攻击者可伪造 XFF 让多用户共享上游 session ID。现在用 `resolveClientIp`（TCP socket），XFF 仅在 `trustProxy: true` 时可用。
+>
+> **测试**：556 pass / 0 fail（新增 22 个测试覆盖以上修复）。
+
 > **v0.2.0.2 — 日志系统优化（请求追踪 + 验证码耗时拆分 + 错误分类 + 文件持久化）**
 >
 > 全面优化代理日志系统，从8个维度提升可观测性和诊断效率。
