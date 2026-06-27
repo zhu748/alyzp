@@ -280,6 +280,34 @@ function translateInputItem(item: ResponsesInputItem): TranslatedItem | null {
       return { kind: "message", msg: { role: "user", content: [block] } };
     }
 
+    case "custom_tool_call": {
+      // Codex sends custom_tool_call for tools like apply_patch that use grammar
+      // format instead of JSON Schema. The `input` field contains the freeform
+      // tool input (e.g. patch text), not JSON-encoded arguments.
+      // Translate to an Anthropic tool_use block, same as function_call but
+      // the input is always wrapped in { patch: "..." }.
+      const customInput = item.input || "";
+      const customInputObj: Record<string, unknown> = { patch: typeof customInput === "string" ? customInput : JSON.stringify(customInput) };
+      const customBlock: AnthropicContentBlock = {
+        type: "tool_use",
+        id: item.call_id || item.id || "",
+        name: item.name,
+        input: customInputObj,
+      };
+      return { kind: "message", msg: { role: "assistant", content: [customBlock] } };
+    }
+
+    case "custom_tool_call_output": {
+      // Codex custom tool result → same as function_call_output.
+      const customOutput = item.output ?? "";
+      const customResultBlock: AnthropicContentBlock = {
+        type: "tool_result",
+        tool_use_id: item.call_id || item.id || "",
+        content: typeof customOutput === "string" ? customOutput : JSON.stringify(customOutput),
+      };
+      return { kind: "message", msg: { role: "user", content: [customResultBlock] } };
+    }
+
     case "reasoning": {
       // GLM doesn't accept reasoning items in input. If it has encrypted_content
       // we could pass it through as a system note, but for v1 we just drop it.

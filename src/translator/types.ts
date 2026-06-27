@@ -259,6 +259,20 @@ export type ResponsesInputItem =
       output: string;
     }
   | {
+      type: "custom_tool_call";
+      call_id: string;
+      name: string;
+      input: string;
+      status?: string;
+      id?: string;
+    }
+  | {
+      type: "custom_tool_call_output";
+      call_id: string;
+      output: string;
+      id?: string;
+    }
+  | {
       type: "reasoning";
       id?: string;
       summary?: Array<{ type: "summary_text"; text: string }>;
@@ -299,7 +313,7 @@ export interface OpenAIResponseRequest {
   store?: boolean;
   tools?: ResponsesToolDefinition[];
   tool_choice?: "auto" | "required" | "none" | { type: "function"; name: string } | { type: string; [k: string]: unknown };
-  reasoning?: { effort?: "low" | "medium" | "high"; summary?: "auto" | "concise" | "detailed" | null };
+  reasoning?: { effort?: "low" | "medium" | "high" | "xhigh"; summary?: "auto" | "concise" | "detailed" | null };
   text?: { verbosity?: "low" | "medium" | "high" };
   stop?: string | string[];
   user?: string;
