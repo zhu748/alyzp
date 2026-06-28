@@ -1,5 +1,52 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.9 — 严格请求头白名单 + cache_control 指纹对齐**
+>
+> 基于 2026-06-28 对 app.asar Mf() (offset 886853) + SDK 字面量 (offset 1085109) + yU (offset 887429) 的最新解包,全面对齐真实 ZCode 客户端的请求头指纹。修复了多个之前未发现的指纹泄漏问题。
+>
+> **本次改动**
+>
+> **1. 请求头改为严格白名单(核心改动)**
+>
+> 之前用"黑名单过滤 + 透传"策略,任何未识别的客户端 header 会透传到 z.ai。现在改为**纯白名单**:完全不读客户端 headers,只按 zcode 真实客户端的固定 14 个 header 构造 upstream 请求。任何陌生 header(包括未来 SDK 新增的指纹头)都不会泄漏到上游。
+>
+> **2. wire 顺序完全对齐**
+>
+> 按真实 ZCode 客户端的网络发送顺序:
+> ```
+> content-type → x-api-key/auth → anthropic-version →
+> user-agent → http-referer → x-title → x-zcode-app-version →
+> x-platform → [x-release-channel] → x-client-language →
+> x-client-timezone → x-os-category → [x-os-version] → x-request-id
+> ```
+>
+> **3. 修复 5 处指纹问题**
+>
+> - **移除 `accept: text/event-stream`** —— 真实 zcode 客户端在 /v1/messages 上**根本不发 accept 头**,之前错误地发了反而是指纹
+> - **不显式设 `accept-encoding`** —— 让 fetch 运行时自动加 `gzip, deflate, br`(之前硬编码 `gzip` 是错的)
+> - **新增 `X-Release-Channel`** —— 真实客户端条件发(空值不发),现在通过 `identity.releaseChannel` 配置,默认 "stable"
+> - **修复 `X-Os-Version`** —— 从 `os.release()`(内核版本号)改为 `os.version()`(OS 产品名,如 "Windows 11 Home China")
+> - **修复身份头内部顺序** —— UA→Referer→Title→AppVer(之前是 UA→AppVer→Referer→Title)
+>
+> **4. cache_control 指纹对齐**
+>
+> 对比真实 zcode 抓包(msg[122])发现 2 处 cc 位置不对齐,已修复:
+>
+> - **剥离 `tool_result` 块上的 cc** —— Claude Code 经常在 tool_result 上放 cc,真实 zcode 客户端从不在 tool_result 上放
+> - **cc 只加在最后一条 user 消息的 text 块上** —— 之前会 fallback 到 assistant 消息(指纹错位);现在若最后一条 user 消息只有 tool_result,会追加一个空 text 块作为 cc 锚点(模拟真实 zcode msg[122] 的 cc 锚点模式,text_len=1)
+>
+> **5. Claude Code 工具调用与 harness 完整保留**
+>
+> 验证:CC 发出的 13 个工具的 name/description/input_schema 字面一致透传(总字符数 53369 → 53369,0 丢失);14 条 messages 的所有非 thinking 块完整保留(总字符数 110902 → 110905,差异仅 +3 是剥离 thinking 后的空 text 占位符);CC 的 6681 字符 harness 指令块字面一致保留。
+>
+> **6. 测试覆盖**
+>
+> 595 个测试通过(+13 个新增),覆盖:完整 wire 顺序(coding-plan / start-plan+JWT / OpenAI 三种 format)、CC/Stainless 11 个指纹头剥离、前缀剥离(x-stainless-* / x-claude-*)、23 个乱七八糟 header 零泄漏、captcha 注入路径仍工作、X-Release-Channel 条件发(空/undefined/whitespace)、X-Os-Version 用 os.version() 不是 os.release()、身份块内部顺序。
+>
+> **不影响现有用户**:默认配置无需修改即可获得更严格的指纹对齐。如需自定义 release channel,在 config.yaml 的 identity 节添加 `releaseChannel: stable`。
+>
+> ---
+
 > **v0.2.0.8 — 全面优化 + 请求头调试功能**
 >
 > 本次发版对代理进行了全面的代码优化（安全/性能/健壮性/可维护性），并新增了"请求头调试"功能，方便排查请求转换是否有缺陷。

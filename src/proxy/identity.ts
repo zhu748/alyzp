@@ -181,7 +181,12 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
   // correct wire position ONLY when their value is non-empty. When absent,
   // subsequent headers naturally shift up — preserving the relative order
   // of the headers that ARE present.
-  const headers: IdentityHeaders = {
+  //
+  // We use Partial<IdentityHeaders> during construction because we add keys
+  // incrementally (to preserve insertion order); the optional fields
+  // (X-Release-Channel, X-Os-Version) may or may not be set, and the
+  // required fields are all populated by the time we return.
+  const headers: Partial<IdentityHeaders> = {
     "User-Agent": `ZCode/${appVersion}`,
     "HTTP-Referer": id.refererOrigin || "https://zcode.z.ai",
     "X-Title": id.sourceTitle || "Z Code@electron",
@@ -209,5 +214,5 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
     headers["X-Os-Version"] = env.osVersion;
   }
 
-  return headers;
+  return headers as IdentityHeaders;
 }
