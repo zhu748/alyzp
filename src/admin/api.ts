@@ -658,7 +658,16 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
   }
 
   // Verify auth token for API routes
-  if (path.startsWith("/admin/api/") && path !== "/admin/api/verify") {
+  //
+  // v0.2.0.8 SECURITY: /admin/api/verify is now ALSO subject to the loopback
+  // gate when proxyApiKey is unset (previously it was exempt, leaking "no auth
+  // configured" to non-loopback callers). However, when proxyApiKey IS set,
+  // /verify must fall through to its own route handler so the per-IP
+  // rate-limiting on wrong tokens still works — otherwise the gate would
+  // short-circuit every wrong token to 401 and the verify route's
+  // rate-limit counter would never increment.
+  const isVerifyRouteWithAuth = path === "/admin/api/verify" && opts.config.auth.proxyApiKey;
+  if (path.startsWith("/admin/api/") && !isVerifyRouteWithAuth) {
     // Allow SSE endpoints to receive the token via query parameter, since
     // EventSource cannot set custom HTTP headers.
     const authHeader = req.headers.get("authorization") ?? "";
@@ -668,8 +677,8 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     }
 
     // v0.1.5+ SECURITY: when proxyApiKey is NOT configured, all admin API
-    // routes (except /verify which has its own logic) require the request
-    // to come from the loopback address (127.0.0.1, ::1, localhost).
+    // routes require the request to come from the loopback address
+    // (127.0.0.1, ::1, localhost).
     //
     // Without this check, anyone who can reach the proxy port can:
     //   - POST /admin/api/credentials → inject their own API key
@@ -1130,7 +1139,16 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
       );
       return jsonResp({ ok: true, proxy: trimmed });
     } catch (err) {
-      return errorResponse(500, "update_failed", (err as Error).message);
+      // v0.2.0.8: setAccountProxy now throws on SSRF / scheme validation
+      // failures. Distinguish those (400, client error) from genuine update
+      // failures (500, server error) by sniffing the message — the validator
+      // in store.ts produces messages starting with "Proxy URL" / "Invalid proxy".
+      const msg = (err as Error).message ?? "";
+      const isValidation = /^Proxy URL|Invalid proxy URL|points at an internal|scheme .* is not allowed|missing a hostname/i.test(msg);
+      if (isValidation) {
+        return errorResponse(400, "invalid_param", msg);
+      }
+      return errorResponse(500, "update_failed", msg);
     }
   }
 
@@ -1311,6 +1329,11 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     const ok = await removeAccount(id);
     const errResp = handleMutationResult(ok);
     if (errResp) return errResp;
+    // v0.2.0.8: drop any cached quota result for this account so a future
+    // account reusing the same id (unlikely but possible) doesn't see stale
+    // data. Previously the cache entry leaked — bounded to 50 entries so it
+    // self-corrected eventually, but explicit cleanup is cleaner.
+    quotaCache.delete(id);
     // Hot-swap the in-memory credential if active changed
     const cred = await loadCredential();
     if (cred) opts.auth.setOAuthCredential(cred);
@@ -2211,6 +2234,18 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           },
         };
         logWaiters.push(waiter);
+        // v0.2.0.8: cap concurrent SSE log subscribers. Each connected
+        // dashboard tab holds one entry here; without a cap a script (or a
+        // browser tab flood) could grow logWaiters unbounded, and every
+        // appendLog call would fan out to all of them. 50 is plenty for any
+        // realistic ops use; a 51st connection gets a 503 + explanatory
+        // message so the client can retry with backoff.
+        if (logWaiters.length > 50) {
+          logWaiters.pop(); // undo the push
+          closed = true;
+          controller.error(new Error("Too many concurrent log stream connections (max 50). Close other dashboard tabs and retry."));
+          return;
+        }
 
         // v0.1.5+ HEARTBEAT + SHORTER maxTimeout.
         //

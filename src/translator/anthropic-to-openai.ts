@@ -1,6 +1,15 @@
 /**
  * Anthropic → OpenAI request translator and OpenAI → Anthropic response translator.
  * @see .omo/plans/zcode-proxy.md Task 11
+ *
+ * @deprecated v0.2.0.8: the two exported functions in this file
+ * (`translateRequestAnthropicToOpenAI`, `translateResponseOpenAIToAnthropic`)
+ * are NOT used by any production code path. handler.ts only translates in the
+ * Anthropic→OpenAI / Anthropic→Responses direction, never the reverse. The
+ * functions are retained for test coverage and as a reference implementation
+ * in case reverse translation is needed in the future. Safe to remove if the
+ * project needs to slim down, but keeping them costs ~130 lines and no
+ * runtime overhead (tree-shaken in production builds).
  */
 import type {
   OpenAIChatRequest,

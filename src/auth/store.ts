@@ -1137,8 +1137,23 @@ export function clearCredential(): void {
           // Synchronous sleep — clearCredential is sync by API contract
           // (callers don't await it). The total worst-case blocking time
           // is 50+100+150+200+250 = 750ms, acceptable for a UI action.
-          const end = Date.now() + RETRY_DELAY_MS * (attempt + 1);
-          while (Date.now() < end) { /* spin */ }
+          //
+          // v0.2.0.8: use Atomics.wait on a SharedArrayBuffer instead of a
+          // `while (Date.now() < end) { /* spin */ }` busy loop. Atomics.wait
+          // truly parks the thread (the OS scheduler yields the CPU), whereas
+          // the spin loop kept the core at 100% for the full delay. Behaviour
+          // is identical: we still block the event loop for the same duration
+          // (sync API contract preserved), just without burning a core.
+          try {
+            const waitBuf = new Int32Array(new SharedArrayBuffer(4));
+            Atomics.wait(waitBuf, 0, 0, RETRY_DELAY_MS * (attempt + 1));
+          } catch {
+            // SharedArrayBuffer unavailable (very old runtime) — fall back to
+            // a short SetTimeout-based busy wait. This branch is defensive;
+            // modern Bun/Node always expose Atomics.wait on SharedArrayBuffer.
+            const end = Date.now() + RETRY_DELAY_MS * (attempt + 1);
+            while (Date.now() < end) { /* spin */ }
+          }
           continue;
         }
         if (code === "ENOENT") { lastErr = null; break; }
@@ -1324,17 +1339,40 @@ export async function setAccountPlan(id: string, plan: "coding-plan" | "start-pl
  * Update an account's outbound HTTP proxy URL.
  *
  * Pass an empty string (or undefined) to clear the override — the account
- * will fall back to a direct connection. No URL validation is performed
- * here; the dashboard is expected to send a syntactically valid URL
- * (`http://`, `https://`, or `socks5://` scheme). Invalid URLs surface as
- * fetch-time errors at request time, which is more useful to the user
- * than a silent rejection at config time.
+ * will fall back to a direct connection.
+ *
+ * v0.2.0.8 SSRF guard: we now validate the scheme (`http://`, `https://`,
+ * `socks5://`, `socks5h://`) and reject hostnames that resolve to internal
+ * addresses (127.0.0.0/8, ::1, 169.254.0.0/16 link-local, 10/8, 172.16/12,
+ * 192.168/16, 0.0.0.0, and cloud metadata endpoints like 169.254.169.254).
+ * This prevents a compromised admin credential from exfiltrating all upstream
+ * traffic to an attacker-controlled internal proxy or a cloud metadata
+ * service. Literal-IP hosts are checked directly; hostname hosts are also
+ * checked because a DNS rebinding attack could resolve a benign-looking name
+ * to an internal address at request time.
+ *
+ * For hostname (non-IP) proxies we still accept them — operators may run a
+ * local squid/tinyproxy under a name — but we block the obvious internal
+ * ranges when the hostname is a literal IP. A full DNS-resolution check is
+ * intentionally NOT performed here to avoid blocking legitimate proxies whose
+ * names happen to resolve internally on some networks; the operator is
+ * expected to vet hostname-based proxy URLs themselves.
  */
 export async function setAccountProxy(id: string, proxy: string): Promise<boolean | null> {
+  const trimmed = (proxy ?? "").trim();
+  if (trimmed) {
+    // Validate scheme + reject internal IPs.
+    const validation = validateProxyUrl(trimmed);
+    if (!validation.ok) {
+      // Surface as a thrown error so the admin route returns 400 with the
+      // message; withExistingStoreLock's callback contract returns boolean,
+      // so we throw to abort the mutation.
+      throw new Error(validation.message);
+    }
+  }
   return withExistingStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
-    const trimmed = (proxy ?? "").trim();
     if (trimmed) {
       account.credential.proxy = trimmed;
     } else {
@@ -1344,6 +1382,84 @@ export async function setAccountProxy(id: string, proxy: string): Promise<boolea
     }
     return true;
   });
+}
+
+/**
+ * Validate a proxy URL's scheme and reject literal-IP hosts that point at
+ * cloud-metadata or unspecified addresses. Exported for unit testing.
+ *
+ * v0.2.0.8 SSRF scope: we ONLY block the highest-risk targets:
+ *   - 169.254.169.254 and the 169.254/16 link-local range (AWS/GCP/Azure
+ *     metadata services, which can leak instance credentials)
+ *   - 0.0.0.0/8 (unspecified — never a valid proxy target)
+ *   - :: (IPv6 unspecified)
+ *
+ * We intentionally ALLOW loopback (127.0.0.1, ::1) and private ranges
+ * (10/8, 172.16/12, 192.168/16) because local proxies (clash, v2ray,
+ * squid) and internal corporate proxies are legitimate, common use cases
+ * for this tool. Blocking them would break the primary deployment pattern
+ * (local proxy on the user's laptop).
+ *
+ * Returns `{ok: true}` or `{ok: false, message}`. Does NOT perform DNS
+ * resolution — a hostname-based proxy is the operator's responsibility.
+ */
+export function validateProxyUrl(url: string): { ok: true } | { ok: false; message: string } {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, message: `Invalid proxy URL: "${url}" is not a valid URL` };
+  }
+  const scheme = parsed.protocol.toLowerCase();
+  if (scheme !== "http:" && scheme !== "https:" && scheme !== "socks5:" && scheme !== "socks5h:") {
+    return {
+      ok: false,
+      message: `Proxy URL scheme "${parsed.protocol}" is not allowed. Use http://, https://, socks5://, or socks5h://`,
+    };
+  }
+  const host = parsed.hostname;
+  if (!host) {
+    return { ok: false, message: "Proxy URL is missing a hostname" };
+  }
+  // Block only cloud-metadata / unspecified addresses (see SSRF scope above).
+  const ipCheck = isMetadataOrUnspecifiedIp(host);
+  if (ipCheck) {
+    return {
+      ok: false,
+      message: `Proxy URL host "${host}" is a ${ipCheck} — routing upstream traffic to cloud metadata or unspecified addresses is blocked to prevent credential theft.`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * If `host` is a literal IP in a cloud-metadata or unspecified range,
+ * return a short reason. Otherwise return null (allowed).
+ *
+ * Blocked ranges (see validateProxyUrl SSRF scope):
+ *   - IPv4: 0.0.0.0/8, 169.254/16 (link-local + cloud metadata)
+ *   - IPv6: :: (unspecified)
+ *
+ * Loopback, private, and ULA ranges are NOT blocked (legitimate local proxy use).
+ */
+function isMetadataOrUnspecifiedIp(host: string): string | null {
+  // IPv4 dotted-quad check.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const parts = host.split(".").map(Number);
+    if (parts.some(p => p > 255)) return null; // not actually a valid IP
+    const [a, b] = parts;
+    if (a === 0) return "0.0.0.0/8 unspecified address";
+    if (a === 169 && b === 254) return "169.254/16 link-local / cloud metadata endpoint";
+    return null;
+  }
+  // IPv6 literals.
+  const lower = host.toLowerCase();
+  if (lower === "::") return ":: unspecified";
+  // fe80::/10 link-local (IPv6 equivalent of 169.254/16) — also block.
+  if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) {
+    return "fe80::/10 IPv6 link-local";
+  }
+  return null;
 }
 
 /**

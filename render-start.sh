@@ -151,7 +151,21 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
     else
       # Single credential: wrap as v2 store. `provider` is read from the
       # credential itself for the label.
-      ACCOUNT_ID="$(date +%s | sha256sum | head -c 16)"
+      # v0.2.0.8: use `command -v` to pick `shasum -a 256` on macOS (which
+      # ships without `sha256sum`) and `sha256sum` on Linux. Both emit a
+      # 64-hex-char digest; we take the first 16 for the account id.
+      _HASH_CMD=""
+      if command -v sha256sum >/dev/null 2>&1; then
+        _HASH_CMD="sha256sum"
+      elif command -v shasum >/dev/null 2>&1; then
+        _HASH_CMD="shasum -a 256"
+      fi
+      if [ -n "$_HASH_CMD" ]; then
+        ACCOUNT_ID="$(date +%s | $_HASH_CMD | head -c 16)"
+      else
+        # Fallback: bun-native random string (works everywhere bun runs).
+        ACCOUNT_ID="$(bun -e 'console.log(Math.random().toString(36).slice(2,18))')"
+      fi
       NOW_MS="$(date +%s%3N)"
       echo "[render-start] Detected single credential — wrapping as single-account v2 store."
       cat > "$CRED_FILE" <<EOF

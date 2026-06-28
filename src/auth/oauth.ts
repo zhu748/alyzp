@@ -158,6 +158,13 @@ class CallbackServer {
   listen(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server.on("error", reject);
+      // v0.2.0.8: cap concurrent connections to the localhost callback
+      // server. The OAuth flow only needs ONE callback (the browser redirect
+      // after the user authorizes), so any additional connection is either a
+      // retry, a probe, or a localhost attacker trying to exhaust file
+      // descriptors. maxConnections=5 is generous enough to tolerate browser
+      // favicon/two-redirect bursts while still bounding resource use.
+      this.server.maxConnections = 5;
       this.server.listen(0, "127.0.0.1", () => {
         const addr = this.server.address();
         if (!addr || typeof addr !== "object") {

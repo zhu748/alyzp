@@ -60,22 +60,33 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   return result;
 }
 
+/** Type guards for AnthropicContentBlock discriminated union.
+ *  v0.2.0.8: replaces `(b as any).text` / `(b as any).id` casts that bypassed
+ *  the type system. Using guards lets TypeScript narrow the union so we get
+ *  compile-time safety on field access. */
+function isTextBlock(b: AnthropicContentBlock): b is { type: "text"; text: string } {
+  return b.type === "text";
+}
+function isToolUseBlock(b: AnthropicContentBlock): b is { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } {
+  return b.type === "tool_use";
+}
+
 /** Translate an Anthropic messages response into an OpenAI chat completion response. */
 export function translateResponseAnthropicToOpenAI(
   resp: AnthropicMessagesResponse,
   model: string,
 ): OpenAIChatResponse {
-  const textBlocks = resp.content.filter((b) => b.type === "text");
-  const toolUseBlocks = resp.content.filter((b) => b.type === "tool_use");
+  const textBlocks = resp.content.filter(isTextBlock);
+  const toolUseBlocks = resp.content.filter(isToolUseBlock);
 
-  const content = textBlocks.map((b) => (b as any).text).join("") || null;
+  const content = textBlocks.map((b) => b.text).join("") || null;
   const toolCalls = toolUseBlocks.length > 0
     ? toolUseBlocks.map((b) => ({
-        id: (b as any).id,
+        id: b.id,
         type: "function" as const,
         function: {
-          name: (b as any).name,
-          arguments: JSON.stringify((b as any).input ?? {}),
+          name: b.name,
+          arguments: JSON.stringify(b.input ?? {}),
         },
       }))
     : undefined;

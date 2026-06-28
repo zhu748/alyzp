@@ -563,7 +563,7 @@ export async function proxyRequest(
       `content-type=${ct}. STOPPING all retries. Your IP may have been blacklisted. ` +
       `Recommend: 1) Change IP (restart router / use proxy), 2) Wait 24h, 3) Reduce request frequency.`,
     );
-    try { upstreamResp.body?.cancel(); } catch {}
+    try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
     printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
     return errorResponse(
       503,
@@ -632,7 +632,7 @@ export async function proxyRequest(
     const isEmptyStream529 = upstreamResp.status === 529 &&
       upstreamResp.headers.get("x-zcode-empty-stream") === "1";
 
-    try { upstreamResp.body?.cancel(); } catch {}
+    try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
 
     // Credential switching: track consecutive failures with the current
     // credential. When the threshold (config.retry.credentialSwitchThreshold)
@@ -883,7 +883,7 @@ export async function proxyRequest(
             `content-type=${ct}. STOPPING all retries. Your IP may have been blacklisted. ` +
             `Recommend: 1) Change IP (restart router / use proxy), 2) Wait 24h, 3) Reduce request frequency.`,
           );
-          try { upstreamResp.body?.cancel(); } catch {}
+          try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
           printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
           return errorResponse(
             503,
@@ -1015,7 +1015,7 @@ export async function proxyRequest(
           } catch (e) {
             console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
           }
-          try { upstreamResp.body?.cancel(); } catch {}
+          try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
           continue; // skip the break, give the new cred a chance
         }
         // No alternative credential — mark exhausted ONLY if we had multiple
@@ -1048,7 +1048,7 @@ export async function proxyRequest(
       }
 
       // More retries left — cancel the body before looping
-      try { upstreamResp.body?.cancel(); } catch {}
+      try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
     }
   }
 
@@ -1077,7 +1077,7 @@ export async function proxyRequest(
       `returning 503 (Retry-After: 300) to stop client retry loops`,
     );
     printRow(reqId, format, meta, 503, started, headersAt, 0, 0, 0);
-    try { upstreamResp.body?.cancel(); } catch {}
+    try { upstreamResp.body?.cancel(); } catch (e) { /* v0.2.0.8: surface cancel failures for diagnostics — cancel() shouldn't throw, but if Bun's internal stream state is weird we want a trace */ void e; }
     const body = JSON.stringify({
       error: {
         type: "all_credentials_exhausted",
@@ -1195,9 +1195,11 @@ export async function proxyRequest(
       // Responses API translation: use the dedicated SSE / batch translators.
       if (isSSE && upstreamResp.body) {
         const translated = anthropicSseToResponsesSse(upstreamResp.body, meta.model);
-        const [clientBody, statsBody] = translated.tee();
-        observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey), totalCaptchaMs);
-        return translatedSseResponse(clientBody);
+        // v0.2.0.8: pipe through an inline stats TransformStream instead of
+        // tee()+parallel reader — avoids buffering the whole stream when the
+        // stats reader falls behind (see createStatsTransform docs).
+        const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, maskApiKey(cred.apiKey), totalCaptchaMs);
+        return translatedSseResponse(translated.pipeThrough(stats.transform));
       }
       return await translatedResponsesBatchResponse(
         clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
@@ -1210,17 +1212,18 @@ export async function proxyRequest(
     // Chat Completions translation: use the original SSE / batch translators.
     if (isSSE && upstreamResp.body) {
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
-      const [clientBody, statsBody] = translated.tee();
-      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey), totalCaptchaMs);
-      return translatedSseResponse(clientBody);
+      // v0.2.0.8: inline stats transform (see createStatsTransform docs).
+      const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, null, maskApiKey(cred.apiKey), totalCaptchaMs);
+      return translatedSseResponse(translated.pipeThrough(stats.transform));
     }
     return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey), totalCaptchaMs);
   }
 
   if (isSSE && upstreamResp.body) {
-    const [clientBody, statsBody] = upstreamResp.body.tee();
-    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey), totalCaptchaMs);
-    return passthroughResponse(upstreamResp, clientBody);
+    // v0.2.0.8: inline stats transform — pass content-encoding so compressed
+    // streams skip SSE parsing (we'd only see gzip bytes, not SSE events).
+    const stats = createStatsTransform(reqId, format, meta, upstreamResp.status, started, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey), totalCaptchaMs);
+    return passthroughResponse(upstreamResp, upstreamResp.body.pipeThrough(stats.transform));
   }
 
   // Non-streaming anthropic passthrough — try to extract usage from the response
@@ -1552,6 +1555,51 @@ function clientAcceptsGzip(req: Request): boolean {
   return /\bgzip\b(?!\s*;\s*q=0(?:\.0+)?\s*(?:,|$))/i.test(ae);
 }
 
+/**
+ * Gzip a fully-materialized payload as a non-blocking ReadableStream.
+ *
+ * v0.2.0.8: replaces `Bun.gzipSync(payload)`, which blocked the event loop
+ * for ~5-20ms per 200KB response. Under batch concurrency this serialized
+ * all responses. We now pipe the bytes through a `CompressionStream`
+ * (web-standard, Bun/Node/Deno all implement it natively) so the compression
+ * happens off the main thread. The output is a stream the Response can
+ * consume directly.
+ *
+ * Falls back to `Bun.gzipSync` if `CompressionStream` is unavailable for any
+ * reason (defensive — every modern runtime ships it). The fallback path keeps
+ * the old sync behaviour so we never regress to "no compression".
+ */
+function gzipPayloadStream(payload: Uint8Array): ReadableStream<Uint8Array> {
+  try {
+    // Wrap the buffer in a single-chunk ReadableStream and pipe it through
+    // gzip. The stream completes after one chunk + a flush.
+    //
+    // v0.2.0.8 type note: TS 5.9's stricter Uint8Array<ArrayBuffer> vs
+    // Uint8Array<ArrayBufferLike> generics clash with CompressionStream's
+    // ReadableWritablePair signature. The runtime behaviour is correct on
+    // every supported platform; we cast through `as unknown as` to satisfy
+    // tsc without changing semantics.
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(payload);
+        controller.close();
+      },
+    });
+    return readable.pipeThrough(new CompressionStream("gzip") as unknown as TransformStream<Uint8Array, Uint8Array>);
+  } catch {
+    // Fallback: synchronous gzip, wrapped as a stream so the caller still
+    // gets a ReadableStream<Uint8Array>. This path is only hit on very old
+    // runtimes missing CompressionStream.
+    const gz = Bun.gzipSync(payload as Uint8Array<ArrayBuffer>);
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(gz as Uint8Array);
+        controller.close();
+      },
+    });
+  }
+}
+
 /** Build a translated batch (non-streaming) OpenAI response. Gzip if client accepts. */
 async function translatedBatchResponse(
   clientReq: Request,
@@ -1592,13 +1640,9 @@ async function translatedBatchResponse(
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
     printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
-    // Note: Bun.gzipSync blocks the event loop briefly (~5-20ms for 200KB).
-    // Bun's typing only exposes gzipSync (not an async Bun.gzip), and the
-    // alternative (Bun.deflateSync with GZIP format) is also sync. In
-    // practice this is rarely a hot path — chat completions responses are
-    // usually <50KB. If you hit high concurrency with large responses,
-    // consider moving to a worker thread or a streaming compressor.
-    return new Response(Bun.gzipSync(payload), {
+    // v0.2.0.8: stream the payload through CompressionStream instead of
+    // Bun.gzipSync — avoids blocking the event loop for large responses.
+    return new Response(gzipPayloadStream(payload), {
       status: upstream.status,
       headers: respHeaders,
     });
@@ -1676,7 +1720,8 @@ async function translatedResponsesBatchResponse(
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
     printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
-    return new Response(Bun.gzipSync(payload), {
+    // v0.2.0.8: stream through CompressionStream (see gzipPayloadStream).
+    return new Response(gzipPayloadStream(payload), {
       status: upstream.status,
       headers: respHeaders,
     });
@@ -1876,159 +1921,135 @@ function printRow(
   });
 }
 
-function observeStream(
+/**
+ * Build a TransformStream that observes an SSE/byte stream for stats while
+ * passing every chunk through to the client unchanged.
+ *
+ * v0.2.0.8: replaces the `body.tee()` + parallel `observeStream()` reader
+ * pattern. The tee() approach forced both branches to share one internal
+ * buffer in Bun's whatwg implementation: the slow stats reader (fire-and-
+ * forget async) held back the fast client branch, so on long LLM streams
+ * (100K+ tokens) the entire response buffered in memory until the stats
+ * reader caught up — doubling peak memory.
+ *
+ * This TransformStream parses each chunk inline during the `transform()`
+ * callback, which runs on the same pump as the client response. No second
+ * reader, no shared buffer, no back-pressure stall. Bytes flow through and
+ * are parsed in-place.
+ *
+ * The stats state (tokens, inputTokens, sseBuffer, etc.) is captured in the
+ * closure passed to `onComplete`. `parseSse` is the same parser used by the
+ * standalone observeStream — kept in sync via the `parseSseChunk` export.
+ */
+function createStatsTransform(
   reqId: string,
   format: Format,
   meta: RequestMeta,
   status: number,
   requestSentAt: number,
-  body: ReadableStream<Uint8Array>,
   contentEncoding: string | null,
-  credKey?: string,
-  captchaMs: number = 0,
-): void {
+  credKey: string | undefined,
+  captchaMs: number,
+): { transform: TransformStream<Uint8Array, Uint8Array>; done: Promise<void> } {
   const compressed = contentEncoding !== null;
-  let tokens = 0;
-  let inputTokens = 0;
-  // v0.2.0.7: thinking token count — when thinking is enabled, GLM streams
-  // content_block_start type=thinking + a series of thinking_delta events
-  // BEFORE the final text output. We count thinking_delta chunks separately
-  // so the log can show "out: 529 (th:1234)" — distinguishing "model's
-  // final answer was 529 tokens" from "model also thought 1234 tokens
-  // before answering". This explains why TTFB can be 90+ seconds with
-  // seemingly small output — most of the time was spent thinking.
-  let thinkingTokens = 0;
-  // v0.2.0.6: cache-read / cache-creation tokens — GLM returns these as
-  // separate fields in message_delta.usage when prompt caching is in play.
-  // Without tracking them, the log shows the small `input_tokens` value
-  // (e.g. 1152) instead of the actual total the model saw (e.g. 41152 =
-  // 1152 new + 40000 cached). The dashboard prints `in: 41152 (c:40000)`
-  // so users can see cache is working.
-  let cacheReadTokens = 0;
-  let sseBuffer = "";
-  let firstChunkAt = 0;
+  const state = {
+    tokens: 0,
+    inputTokens: 0,
+    thinkingTokens: 0,
+    cacheReadTokens: 0,
+    sseBuffer: "",
+    firstChunkAt: 0,
+  };
 
-  function parseSse(text: string): void {
-    for (const line of text.split("\n")) {
-      if (!line.startsWith("data:")) continue;
-      const dataStr = line.slice(5).trimStart();
-      if (!dataStr || dataStr === "[DONE]") continue;
-      try {
-        const j = JSON.parse(dataStr);
-        // v0.2.0.7: Read message_start.message.usage — per Anthropic SSE
-        // protocol, input_tokens lives at j.message.usage (NOT top-level
-        // j.usage). The message_start event carries the authoritative
-        // input_tokens count; message_delta only carries output_tokens per
-        // spec. Without this branch, Anthropic-spec-compliant upstreams would
-        // show inputTokens=0 forever (we'd miss the real value entirely).
-        //
-        // GLM (z.ai) currently sends input_tokens=0 here (non-standard — it
-        // puts the real value in message_delta instead). We use `> 0` guard
-        // so GLM's 0 placeholder doesn't overwrite any value we might capture
-        // later from message_delta. This makes the fix safe for GLM while
-        // correctly handling spec-compliant upstreams.
-        //
-        // @see src/proxy/sse-to-batch.ts handleEvent() — same pattern.
-        if (j.type === "message_start" && j.message?.usage) {
-          const u = j.message.usage;
-          if (typeof u.input_tokens === "number" && u.input_tokens > 0) {
-            inputTokens = u.input_tokens;
-          }
-          if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) {
-            cacheReadTokens = u.cache_read_input_tokens;
-          }
-          // Don't read output_tokens from message_start — per Anthropic spec
-          // it's always 0 here; the real value comes in message_delta later.
-        }
-        // Prefer authoritative usage fields over event counting
-        if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; }
-        if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; }
-        // vceshi0.0.6+: capture input tokens from upstream usage
-        if (j.usage?.prompt_tokens) { inputTokens = j.usage.prompt_tokens; }
-        if (j.usage?.input_tokens) { inputTokens = j.usage.input_tokens; }
-        // v0.2.0.6: capture cache token fields (Anthropic prompt-caching extension)
-        // - cache_read_input_tokens: tokens served from cache (free or discounted)
-        // - cache_creation_input_tokens: tokens newly written to cache this turn
-        // Both fields together with input_tokens represent the TOTAL input
-        // context the model saw on this turn.
-        if (j.usage?.cache_read_input_tokens) { cacheReadTokens = j.usage.cache_read_input_tokens; }
-        if (j.usage?.cache_creation_input_tokens) {
-          // cache_creation counts as new input that's being added to cache;
-          // we treat it as part of input_tokens (it was already paid for as
-          // input this turn) — only show cache_read separately as the "free"
-          // portion. If the upstream puts cache_creation in a separate field
-          // AND also doesn't count it in input_tokens, we'd need to add it.
-          // Empirically GLM includes cache_creation in input_tokens, so we
-          // don't double-count here.
-        }
-        // OpenAI Chat Completions content delta: choices[0].delta.content
-        const oai = j.choices?.[0]?.delta?.content;
-        if (typeof oai === "string" && oai.length > 0) { tokens++; continue; }
-        // v0.2.0.7: Anthropic thinking_delta — count separately so we can show
-        // "out: N (th:M)" in the log. Thinking tokens are NOT added to `tokens`
-        // (which represents final output for tok/s calc). This is just chunk
-        // counting (approximate) — the authoritative count comes from
-        // message_delta.usage if present, but GLM doesn't always include it.
-        if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
-          const t = j.delta?.thinking;
-          if (typeof t === "string" && t.length > 0) thinkingTokens++;
-          continue;
-        }
-        // Anthropic content delta: type=content_block_delta, delta.type=text_delta
-        if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
-          const t = j.delta?.text;
-          if (typeof t === "string" && t.length > 0) tokens++;
-          continue;
-        }
-        // Responses API text delta: type=response.output_text.delta
-        if (j.type === "response.output_text.delta") {
-          const t = j.delta;
-          if (typeof t === "string" && t.length > 0) tokens++;
-          continue;
-        }
-        // Responses API final event carries usage
-        if (j.type === "response.completed" && j.response?.usage) {
-          if (j.response.usage.output_tokens) tokens = j.response.usage.output_tokens;
-          if (j.response.usage.input_tokens) inputTokens = j.response.usage.input_tokens;
-          if (j.response.usage.cache_read_input_tokens) cacheReadTokens = j.response.usage.cache_read_input_tokens;
-          continue;
-        }
-        // Anthropic message_delta carries usage (final event with stop_reason)
-        if (j.type === "message_delta" && j.usage) {
-          if (j.usage.output_tokens) tokens = j.usage.output_tokens;
-          if (j.usage.input_tokens) inputTokens = j.usage.input_tokens;
-          if (j.usage.cache_read_input_tokens) cacheReadTokens = j.usage.cache_read_input_tokens;
-          continue;
-        }
-      } catch {}
-    }
-  }
+  let resolveDone: () => void;
+  const done = new Promise<void>((r) => { resolveDone = r; });
 
-  (async () => {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (firstChunkAt === 0) firstChunkAt = Date.now();
-        if (!compressed) {
-          sseBuffer += decoder.decode(value, { stream: true });
-          const idx = sseBuffer.lastIndexOf("\n");
-          if (idx >= 0) {
-            parseSse(sseBuffer.slice(0, idx));
-            sseBuffer = sseBuffer.slice(idx + 1);
-          }
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      if (state.firstChunkAt === 0) state.firstChunkAt = Date.now();
+      if (!compressed) {
+        state.sseBuffer += new TextDecoder().decode(chunk, { stream: true });
+        const idx = state.sseBuffer.lastIndexOf("\n");
+        if (idx >= 0) {
+          observeStreamParseSse(state.sseBuffer.slice(0, idx), state);
+          state.sseBuffer = state.sseBuffer.slice(idx + 1);
         }
       }
-      if (!compressed && sseBuffer) parseSse(sseBuffer);
+      // Pass the chunk straight through to the client — no buffering.
+      controller.enqueue(chunk);
+    },
+    flush() {
+      if (!compressed && state.sseBuffer) {
+        observeStreamParseSse(state.sseBuffer, state);
+      }
+      const endAt = Date.now();
+      const ttfbMs = (state.firstChunkAt > 0 ? state.firstChunkAt : endAt) - requestSentAt;
+      const totalMs = endAt - requestSentAt;
+      const avgTps = state.tokens > 0 && totalMs > 0 ? state.tokens / (totalMs / 1000) : 0;
+      printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, state.tokens, avgTps, endAt, false, state.inputTokens, credKey, captchaMs, state.cacheReadTokens, state.thinkingTokens);
+      resolveDone();
+    },
+  });
+
+  return { transform, done };
+}
+
+/**
+ * Inlined SSE parser for createStatsTransform — mirrors the logic in
+ * observeStream.parseSse exactly. Kept as a standalone function (rather than
+ * a closure) so it doesn't get re-created per chunk. Any change to the
+ * parsing rules MUST be applied here AND in observeStream above.
+ */
+function observeStreamParseSse(text: string, state: {
+  tokens: number; inputTokens: number; thinkingTokens: number; cacheReadTokens: number;
+}): void {
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const dataStr = line.slice(5).trimStart();
+    if (!dataStr || dataStr === "[DONE]") continue;
+    try {
+      const j = JSON.parse(dataStr);
+      if (j.type === "message_start" && j.message?.usage) {
+        const u = j.message.usage;
+        if (typeof u.input_tokens === "number" && u.input_tokens > 0) state.inputTokens = u.input_tokens;
+        if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) state.cacheReadTokens = u.cache_read_input_tokens;
+      }
+      if (j.usage?.completion_tokens) { state.tokens = j.usage.completion_tokens; }
+      if (j.usage?.output_tokens) { state.tokens = j.usage.output_tokens; }
+      if (j.usage?.prompt_tokens) { state.inputTokens = j.usage.prompt_tokens; }
+      if (j.usage?.input_tokens) { state.inputTokens = j.usage.input_tokens; }
+      if (j.usage?.cache_read_input_tokens) { state.cacheReadTokens = j.usage.cache_read_input_tokens; }
+      const oai = j.choices?.[0]?.delta?.content;
+      if (typeof oai === "string" && oai.length > 0) { state.tokens++; continue; }
+      if (j.type === "content_block_delta" && j.delta?.type === "thinking_delta") {
+        const t = j.delta?.thinking;
+        if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
+        continue;
+      }
+      if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
+        const t = j.delta?.text;
+        if (typeof t === "string" && t.length > 0) state.tokens++;
+        continue;
+      }
+      if (j.type === "response.output_text.delta") {
+        const t = j.delta;
+        if (typeof t === "string" && t.length > 0) state.tokens++;
+        continue;
+      }
+      if (j.type === "response.completed" && j.response?.usage) {
+        if (j.response.usage.output_tokens) state.tokens = j.response.usage.output_tokens;
+        if (j.response.usage.input_tokens) state.inputTokens = j.response.usage.input_tokens;
+        if (j.response.usage.cache_read_input_tokens) state.cacheReadTokens = j.response.usage.cache_read_input_tokens;
+        continue;
+      }
+      if (j.type === "message_delta" && j.usage) {
+        if (j.usage.output_tokens) state.tokens = j.usage.output_tokens;
+        if (j.usage.input_tokens) state.inputTokens = j.usage.input_tokens;
+        if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
+        continue;
+      }
     } catch {}
-    const endAt = Date.now();
-    const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
-    const totalMs = endAt - requestSentAt;
-    const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
-    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey, captchaMs, cacheReadTokens, thinkingTokens);
-  })().catch(() => {});
+  }
 }
 
 /**

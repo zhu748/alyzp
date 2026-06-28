@@ -259,6 +259,20 @@ function mapStopReason(stopReason: string): string {
  * Transform an OpenAI SSE stream into Anthropic SSE format.
  * Input: ReadableStream<Uint8Array> (OpenAI SSE bytes)
  * Output: ReadableStream<Uint8Array> (Anthropic SSE bytes)
+ *
+ * @deprecated v0.2.0.8: this function is NOT used by any production code path
+ * (handler.ts only does Anthropic→OpenAI / Anthropic→Responses translation,
+ * never the reverse). It is retained solely for test coverage and as a stub
+ * for future reverse-translation support.
+ *
+ * KNOWN BUG: the current implementation emits one content_block_start +
+ * content_block_delta + content_block_stop triple per OpenAI delta chunk,
+ * producing N independent 1-token blocks instead of one block with N deltas.
+ * This violates the Anthropic SSE spec (a single text block should emit
+ * start ONCE, then multiple deltas at the same index, then ONE stop). Any
+ * future production use MUST fix this before shipping — see the
+ * `blockIndex++` line below and rework it to reuse the index across deltas
+ * from the same content block.
  */
 export function openaiSseToAnthropicSse(
   upstream: ReadableStream<Uint8Array>,

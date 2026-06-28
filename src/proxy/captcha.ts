@@ -203,13 +203,40 @@ export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: st
  * Solve the captcha with retries. Config-fetch failures are NOT retried
  * (unrecoverable); only solve failures (SDK timeout, instance init error)
  * trigger the retry loop.
+ *
+ * v0.2.0.8: each solveInJsdom() call is now wrapped in a HARD outer timeout
+ * (SOLVE_TIMEOUT_MS + 10s grace) as a safety net. The inner solve already
+ * has two independent timeouts (SDK_LOAD_TIMEOUT_MS, SOLVE_TIMEOUT_MS), but
+ * JSDOM on Bun has edge cases where a Promise can hang without either timer
+ * firing — e.g. the SDK's internal callback never runs AND the setTimeout
+ * gets swallowed by a jsdom event-loop quirk. The outer race guarantees we
+ * always reject (and run finally cleanup) even in those pathological cases.
+ *
+ * The grace margin is deliberately large (10s over the inner timeout) so we
+ * NEVER pre-empt a healthy solve — if the inner timeout is 40s, the outer
+ * guard only fires at 50s, by which point the inner path has definitely
+ * failed. This is a pure safety net, not a behavior change.
  */
 async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string): Promise<string> {
   const tag = reqId ? `${reqId} ` : "";
   let lastErr: Error | null = null;
   for (let attempt = 1; attempt <= SOLVE_RETRIES; attempt++) {
     try {
-      return await solveInJsdom(cfg);
+      // v0.2.0.8: outer hard-timeout race. If solveInJsdom's internal
+      // timeouts both fail to fire (jsdom edge case), this guarantee
+      // ensures we still reject and the finally block runs to release the
+      // JSDOM instance (50-100MB each).
+      const HARD_GUARD_MS = SOLVE_TIMEOUT_MS + SDK_LOAD_TIMEOUT_MS + 10_000;
+      const result = await Promise.race([
+        solveInJsdom(cfg),
+        new Promise<never>((_, reject) => {
+          setTimeout(
+            () => reject(new Error(`captcha hard-guard timeout after ${HARD_GUARD_MS}ms (inner timeouts failed to fire — JSDOM may be stuck)`)),
+            HARD_GUARD_MS,
+          );
+        }),
+      ]);
+      return result;
     } catch (err) {
       lastErr = err as Error;
       const msg = (err as Error).message ?? "unknown";

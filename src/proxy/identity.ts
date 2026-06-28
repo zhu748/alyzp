@@ -54,15 +54,30 @@ function osCategory(platform: NodeJS.Platform | string): string {
 }
 
 /**
- * Build the identity headers injected upstream — matching the real ZCode
- * client's buildZCodeSourceHeaders() output.
+ * Process-level cached environment values. None of these change for the
+ * lifetime of the process, but the original implementation re-derived them
+ * on every upstream request:
+ *   - `Intl.DateTimeFormat().resolvedOptions()` constructs a new formatter
+ *     and runs locale resolution each call (~0.1-0.5ms CPU on a cold ICU).
+ *   - `os.release()` is a synchronous syscall.
+ * Under load (e.g. a batch request fan-out) this added up. We compute once
+ * lazily and reuse. All values are primitives, so there's no mutation risk.
  *
- * Environmental headers (X-Platform / X-Client-* / X-Os-*) are taken from the
- * proxy's runtime environment, the closest faithful reproduction of what the
- * client emits on its own host.
+ * v0.2.0.8.
  */
-export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
-  const appVersion = id.appVersion || "unknown";
+interface CachedEnv {
+  platform: NodeJS.Platform | string;
+  arch: string;
+  osCategory: string;
+  clientLanguage: string;
+  clientTimezone: string;
+  osVersion: string;
+}
+
+let _cachedEnv: CachedEnv | null = null;
+
+function getCachedEnv(): CachedEnv {
+  if (_cachedEnv) return _cachedEnv;
   const platform = os.platform();
   const arch = os.arch();
 
@@ -83,16 +98,45 @@ export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
     /* keep empty */
   }
 
+  _cachedEnv = {
+    platform,
+    arch,
+    osCategory: osCategory(platform),
+    clientLanguage,
+    clientTimezone,
+    osVersion,
+  };
+  return _cachedEnv;
+}
+
+/** Test-only hook: clears the cached env so tests can simulate a different
+ *  host platform. Not exported via the public surface. */
+export function _resetIdentityEnvCacheForTesting(): void {
+  _cachedEnv = null;
+}
+
+/**
+ * Build the identity headers injected upstream — matching the real ZCode
+ * client's buildZCodeSourceHeaders() output.
+ *
+ * Environmental headers (X-Platform / X-Client-* / X-Os-*) are taken from the
+ * proxy's runtime environment, the closest faithful reproduction of what the
+ * client emits on its own host.
+ */
+export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
+  const env = getCachedEnv();
+  const appVersion = id.appVersion || "unknown";
+
   const headers: IdentityHeaders = {
     "User-Agent": `ZCode/${appVersion}`,
     "X-ZCode-App-Version": appVersion,
     "HTTP-Referer": id.refererOrigin || "https://zcode.z.ai",
     "X-Title": id.sourceTitle || "Z Code@electron",
-    "X-Platform": `${platform}-${arch}`,
-    "X-Client-Language": clientLanguage,
-    "X-Client-Timezone": clientTimezone,
-    "X-Os-Category": osCategory(platform),
-    "X-Os-Version": osVersion,
+    "X-Platform": `${env.platform}-${env.arch}`,
+    "X-Client-Language": env.clientLanguage,
+    "X-Client-Timezone": env.clientTimezone,
+    "X-Os-Category": env.osCategory,
+    "X-Os-Version": env.osVersion,
   };
   return headers;
 }

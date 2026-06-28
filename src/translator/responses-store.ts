@@ -13,6 +13,17 @@
  * Restarting the proxy drops all stored conversations (matches the expectation
  * that a local proxy is short-lived; clients using `store:true` for long-lived
  * sessions should re-run `auth login` after a restart).
+ *
+ * v0.2.0.8 NOTE: persistence to disk was considered (so Codex sessions
+ * survive restarts) but deliberately NOT implemented because:
+ *   1. Conversation history may contain sensitive code/prompts — encrypting
+ *      it with the fixed "520" key offers only obfuscation (see auth/store.ts).
+ *   2. Schema migrations across versions add complexity for marginal benefit.
+ *   3. The primary deployment (apikey mode, short-lived container) rarely
+ *      benefits from cross-restart session continuity.
+ * If you need this, consider implementing an opt-in ZCODE_RESPONSES_PERSIST
+ * env flag that serializes the store to STORE_DIR/responses.json with the
+ * same AES-256-GCM fixed-key encryption used for credentials.
  */
 
 interface StoredTurn {
