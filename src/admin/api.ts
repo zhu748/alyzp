@@ -549,15 +549,6 @@ function* iterRingBuffer(): Generator<{ seq: number; time: string; level: string
   }
 }
 
-/**
- * Get the first (oldest) entry in the ring buffer, or null if empty.
- */
-function ringBufferFirst(): { seq: number; time: string; level: string; message: string } | null {
-  if (logRingCount === 0) return null;
-  const start = logRingCount < LOG_BUFFER_SIZE ? 0 : logRingWrite;
-  return logBufferRing[start];
-}
-
 /** Add a log entry to the buffer (called by intercepting console.log). */
 export function appendLog(level: string, message: string) {
   // vceshi0.0.6+: verbose log lines (containing [verbose]) get a higher char
@@ -2207,11 +2198,37 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
           lastSentSeq = logSeq;
         };
 
-        // Send existing buffered logs first.
-        const first = ringBufferFirst();
-        const startSeq = first ? first.seq : logSeq + 1;
-        for (const entry of iterRingBuffer()) {
-          if (entry.seq < startSeq) continue;
+        // Send existing buffered logs first — but ONLY the most recent
+        // INITIAL_REPLAY_LIMIT entries, not the entire ring buffer.
+        //
+        // === CRITICAL FIX (运行久了刷新卡顿) ===
+        // Previously this loop sent ALL entries in the ring buffer (up to
+        // LOG_BUFFER_SIZE = 2000). When the server had been running long
+        // enough to fill the buffer, every dashboard refresh pushed 2000
+        // SSE messages to the browser in ~50ms. Even with the client-side
+        // rAF debounce in renderLogs(), this still:
+        //   - Allocated 2000 JSON-encode operations on the main thread
+        //   - Pushed 2000 entries through the SSE controller (each = a
+        //     chunked write + TCP flush)
+        //   - Forced the browser to parse 2000 SSE messages + JSON.parse
+        //     each one + push to logLines + splice when > 2000
+        //   - Made the dashboard log panel jump from empty → 2000 rows
+        //     in one frame, causing layout thrash
+        //
+        // The user only needs "what just happened" context on refresh —
+        // 200 recent entries is plenty for that. Older history is still
+        // queryable via the /admin/api/logs batch endpoint (with search
+        // + filter + pagination) and the on-disk log file (if enabled).
+        //
+        // The cap is intentionally a separate constant from
+        // LOG_BUFFER_SIZE so we can tune replay size independently of
+        // retention.
+        const INITIAL_REPLAY_LIMIT = 200;
+        const allBuffered = Array.from(iterRingBuffer());
+        const replay = allBuffered.length > INITIAL_REPLAY_LIMIT
+          ? allBuffered.slice(allBuffered.length - INITIAL_REPLAY_LIMIT)
+          : allBuffered;
+        for (const entry of replay) {
           send(entry);
         }
         lastSentSeq = logSeq;

@@ -3788,7 +3788,44 @@ function connectLogStream(){
 function appendLog(entry){
   logLines.push(entry);
   if(logLines.length>2000)logLines=logLines.slice(-1000);
-  renderLogs();
+  scheduleLogRender();
+}
+/**
+ * Debounced log renderer.
+ *
+ * === CRITICAL FIX (运行久了刷新卡顿) ===
+ * Previously appendLog() called renderLogs() directly. The SSE log stream
+ * replays the entire server-side ring buffer (up to 2000 entries) on every
+ * dashboard refresh — each entry triggered a full renderLogs(), which does
+ * O(N) filter + O(N) innerHTML rebuild. Result: 2000 × O(2000) ≈ 4M DOM
+ * operations on every F5, freezing the tab for several seconds. The longer
+ * the server ran, the fuller the ring buffer, the worse the freeze —
+ * matching the user's "运行久了刷新卡一会才能点击" symptom exactly.
+ *
+ * Now we coalesce multiple appendLog calls within the same animation frame
+ * into a single renderLogs(). The initial SSE burst (2000 entries arriving
+ * in ~50ms) now triggers ONE render instead of 2000. Steady-state logging
+ * (1 entry every few seconds) still renders immediately because rAF fires
+ * in <16ms.
+ *
+ * The fallback to setTimeout(0) handles environments where requestAnimationFrame
+ * is throttled (background tabs — though we already pause SSE there too).
+ */
+let _logRenderPending=false;
+function scheduleLogRender(){
+  if(_logRenderPending)return;
+  _logRenderPending=true;
+  if(typeof requestAnimationFrame==='function'){
+    requestAnimationFrame(()=>{
+      _logRenderPending=false;
+      renderLogs();
+    });
+  }else{
+    setTimeout(()=>{
+      _logRenderPending=false;
+      renderLogs();
+    },0);
+  }
 }
 /**
  * Determine if a log entry should be renderable as an expandable row.
@@ -3830,6 +3867,27 @@ function renderLogs(){
     if(search&&!l.message.toLowerCase().includes(search))return false;
     return true;
   });
+  /* === PERFORMANCE FIX (运行久了刷新卡顿) ===
+   * Cap the number of DOM nodes we actually render to MAX_RENDERED_LOGS.
+   * Even with the rAF debounce in scheduleLogRender(), building 2000
+   * <div> nodes via innerHTML on every filter keystroke is wasteful and
+   * causes visible jank on slower machines. The in-memory `logLines`
+   * array keeps the full 2000-entry window for search accuracy — we just
+   * only render the most recent MAX_RENDERED_LOGS of the filtered set.
+   * A small "showing N of M" hint is appended when truncation occurs so
+   * the user understands why older rows are missing.
+   *
+   * 500 is chosen as a balance: large enough that the user never notices
+   * the cap during normal browsing, small enough that innerHTML rebuilds
+   * stay under 16ms even on low-end hardware.
+   */
+  const MAX_RENDERED_LOGS=500;
+  let visible=filtered;
+  let truncatedCount=0;
+  if(filtered.length>MAX_RENDERED_LOGS){
+    truncatedCount=filtered.length-MAX_RENDERED_LOGS;
+    visible=filtered.slice(-MAX_RENDERED_LOGS);
+  }
   /* Render with colored levels + expandable rows for debug/verbose/long logs.
    * Each row is a <div class="log-line"> with:
    *   - a toggle icon span (▶/▼/blank)
@@ -3839,7 +3897,7 @@ function renderLogs(){
    * We track expanded state by seq (monotonic id from the server) so that
    * re-rendering on new log arrival doesn't lose the user's expand selections.
    */
-  box.innerHTML=filtered.map(l=>{
+  const rowsHtml=visible.map(l=>{
     const lvl=l.level||'info';
     const msg=l.message||'';
     const expandable=isLogExpandable(l);
@@ -3859,6 +3917,12 @@ function renderLogs(){
     const clickHandler=expandable?`onclick="toggleLogExpand(${l.seq})"`:'';
     return `<div class="${cls.join(' ')}" ${clickHandler}>${toggle}<span class="log-time">[${l.time}]</span> <span class="log-level-${lvl}">[${lvl}]</span>${tag} ${summary}${full}</div>`;
   }).join('');
+  // When truncated, prepend a hint so the user knows older matches exist
+  // but are not rendered. They can narrow the search filter to surface them.
+  const truncationHint=truncatedCount>0
+    ? `<div class="log-line" style="color:var(--text-3);font-style:italic;padding:4px 8px">… 已隐藏更早的 ${truncatedCount} 条匹配日志（缩小搜索条件可查看） …</div>`
+    : '';
+  box.innerHTML=truncationHint+rowsHtml;
   if(document.getElementById('logAutoScroll').checked)box.scrollTop=box.scrollHeight;
 }
 /** Toggle a single log row's expanded state by seq id. */

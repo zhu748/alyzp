@@ -43,6 +43,18 @@
 >
 > 595 个测试通过(+13 个新增),覆盖:完整 wire 顺序(coding-plan / start-plan+JWT / OpenAI 三种 format)、CC/Stainless 11 个指纹头剥离、前缀剥离(x-stainless-* / x-claude-*)、23 个乱七八糟 header 零泄漏、captcha 注入路径仍工作、X-Release-Channel 条件发(空/undefined/whitespace)、X-Os-Version 用 os.version() 不是 os.release()、身份块内部顺序。
 >
+> **7. 控制面板刷新卡顿优化(重推补丁)**
+>
+> 修复"运行久了刷新控制面板卡一会才能点击"的性能问题。根因:SSE 日志流在刷新时把服务端 ring buffer(最多 2000 条)一次性回放给浏览器,客户端 `appendLog()` 每收到一条就调一次 `renderLogs()`,而 `renderLogs()` 会 filter 全部 logLines + 用 innerHTML 重建整个日志框 DOM。结果 2000 × O(2000) ≈ 4,000,000 次 DOM 操作,浏览器主线程被冻结数秒。服务端运行越久,ring buffer 越满,卡顿越明显。
+>
+> 三处修复:
+>
+> - **客户端 debounce renderLogs** —— 新增 `scheduleLogRender()`,用 `requestAnimationFrame` 合并同一帧内的多次 `appendLog` 调用。SSE 日志爆发从 2000 次 render 降为 1 次,稳态日志(几秒一条)仍立即渲染(rAF < 16ms)
+> - **服务端 SSE 首连只回放最近 200 条** —— 之前会 dump 全部 2000 条 ring buffer,现在只回放最近 200 条(`INITIAL_REPLAY_LIMIT`),网络流量降到 1/10。更老的历史仍可通过 `/admin/api/logs` 批量接口(带 search/filter/分页)查询
+> - **renderLogs 限制 DOM 渲染条数** —— 新增 `MAX_RENDERED_LOGS=500` 上限,超出的旧日志只保留在内存供 search/filter,不写进 DOM。每次重建 DOM 的成本稳定在 16ms 内,带"已隐藏更早的 N 条匹配日志"提示
+>
+> 测试:595 个测试全部通过,类型检查零错误。改动完全向后兼容 —— `/admin/api/logs` 批量接口仍返回完整 2000 条供搜索。
+>
 > **不影响现有用户**:默认配置无需修改即可获得更严格的指纹对齐。如需自定义 release channel,在 config.yaml 的 identity 节添加 `releaseChannel: stable`。
 >
 > ---
