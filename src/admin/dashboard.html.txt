@@ -2560,6 +2560,7 @@ async function initDashboard(){
     loadStats(),
     loadDebugDumps(),
     loadProxyPool(),
+    checkRunningTestJob(),
   ]).catch(e => console.error('initDashboard batch 2 failed:', e));
   connectLogStream();
   // Sync the log-page debug toggle with the server's current state, so
@@ -4589,6 +4590,7 @@ let ppPoolState=null;
 // Test results cache: { [proxyId]: { ok, latencyMs, error?, status? } | 'testing' }
 let ppTestResults={};
 let ppTestAllRunning=false;
+let ppTestPollTimer=null;
 
 async function loadProxyPool(){
   try{
@@ -4838,82 +4840,140 @@ async function testOneProxy(id){
   renderProxyPool();
 }
 
-// Test ALL proxies in batches of batchSize (concurrent within each batch)
+// Start a BACKGROUND test-all job on the server and poll for progress.
+// The job survives page close — reopening the page resumes polling.
 async function testAllProxies(){
-  if(ppTestAllRunning)return;
+  if(ppTestAllRunning){
+    toast('已有检测任务在运行中','warn');
+    return;
+  }
   if(!ppPoolState||!ppPoolState.proxies||ppPoolState.proxies.length===0){
     toast('代理池为空，无需检测','warn');
     return;
   }
   const batchSize=Math.max(1,Math.min(50,parseInt(document.getElementById('ppBatchSize').value,10)||5));
   const autoRemove=document.getElementById('ppAutoRemoveFailed').checked;
-  const proxies=ppPoolState.proxies;
-  const total=proxies.length;
-  let tested=0,okCount=0,failCount=0;
-  const failedIds=[]; // collect failed proxy ids for auto-removal
 
-  ppTestAllRunning=true;
-  const btn=document.getElementById('ppTestAllBtn');
-  if(btn)btn.disabled=true;
-  const progress=document.getElementById('ppTestProgress');
-  const progressText=document.getElementById('ppTestProgressText');
-  progress.style.display='flex';
+  try{
+    // Start the background job on the server.
+    const r=await fetch(API+'/admin/api/proxy-pool/test-all',{
+      method:'POST',headers:authHeaders(),
+      body:JSON.stringify({batchSize,autoRemove}),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const state=await r.json();
+    ppTestAllRunning=true;
+    const btn=document.getElementById('ppTestAllBtn');
+    if(btn)btn.disabled=true;
+    toast(`后台检测已启动：共 ${state.total} 个代理，可关闭页面，任务在服务器继续运行`);
+    // Start polling for progress.
+    pollTestJob();
+  }catch(e){
+    console.error('testAllProxies failed:',e);
+    toast('启动检测失败：'+e.message,'error');
+  }
+}
 
-  // Mark all as testing
-  for(const p of proxies)ppTestResults[p.id]='testing';
-  renderProxyPool();
-
-  // Process in batches
-  for(let i=0;i<total;i+=batchSize){
-    const batch=proxies.slice(i,i+batchSize);
-    const promises=batch.map(async p=>{
-      try{
-        const r=await fetch(API+'/admin/api/proxy-pool/test-one',{
-          method:'POST',headers:authHeaders(),
-          body:JSON.stringify({id:p.id}),
-        });
-        if(!r.ok)throw new Error('HTTP '+r.status);
-        const data=await r.json();
-        ppTestResults[p.id]=data;
-        if(data.ok){okCount++;}else{failCount++;failedIds.push(p.id);}
-      }catch(e){
-        ppTestResults[p.id]={ok:false,error:e.message,latencyMs:0};
-        failCount++;
-        failedIds.push(p.id);
+// Poll the server for test job progress. Runs every 1.5s while the job is
+// active. Updates the progress display and test results table. When the job
+// finishes, reloads the pool (to reflect auto-removals) and shows a toast.
+function pollTestJob(){
+  if(ppTestPollTimer){clearTimeout(ppTestPollTimer);ppTestPollTimer=null;}
+  ppTestPollTimer=setTimeout(async()=>{
+    try{
+      const r=await fetch(API+'/admin/api/proxy-pool/test-status',{headers:authHeaders()});
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      const state=await r.json();
+      // Merge server results into ppTestResults for the table render.
+      if(state.results){
+        for(const[id,result]of Object.entries(state.results)){
+          ppTestResults[id]=result;
+        }
       }
-      tested++;
-      progressText.textContent=`检测中... ${tested}/${total}（成功 ${okCount}，失败 ${failCount}）`;
-    });
-    await Promise.all(promises);
-    renderProxyPool();
-  }
+      // Mark untested proxies (total - tested) as still 'testing' if the job
+      // is running, so the table shows them correctly.
+      if(ppPoolState&&ppPoolState.proxies){
+        const testedIds=new Set(Object.keys(state.results||{}));
+        for(const p of ppPoolState.proxies){
+          if(!testedIds.has(p.id)){
+            ppTestResults[p.id]=state.running?'testing':{ok:false,error:'未检测',latencyMs:0};
+          }
+        }
+      }
+      // Update progress display.
+      const progress=document.getElementById('ppTestProgress');
+      const progressText=document.getElementById('ppTestProgressText');
+      if(state.running){
+        progress.style.display='flex';
+        progressText.textContent=`检测中... ${state.tested}/${state.total}（成功 ${state.okCount}，失败 ${state.failCount}）— 可关闭页面，任务在后台继续`;
+      }else if(state.total>0){
+        // Job finished.
+        progress.style.display='flex';
+        let txt=`检测完成：共 ${state.total}，成功 ${state.okCount}，失败 ${state.failCount}`;
+        if(state.autoRemove&&state.removedCount>0){
+          txt+=`；已自动删除 ${state.removedCount} 个`;
+        }
+        progressText.textContent=txt;
+        ppTestAllRunning=false;
+        const btn=document.getElementById('ppTestAllBtn');
+        if(btn)btn.disabled=false;
+        // Reload pool to reflect auto-removals, then stop polling.
+        await loadProxyPool();
+        // Show a toast only once when the job transitions to finished.
+        if(!ppJobFinishedNotified){
+          ppJobFinishedNotified=true;
+          toast(txt,state.okCount>0?'success':'warn');
+        }
+        // Hide progress after 5 seconds.
+        setTimeout(()=>{progress.style.display='none';},5000);
+        ppTestPollTimer=null;
+        return;
+      }else{
+        progress.style.display='none';
+        ppTestAllRunning=false;
+        const btn=document.getElementById('ppTestAllBtn');
+        if(btn)btn.disabled=false;
+        ppTestPollTimer=null;
+        return;
+      }
+      renderProxyPool();
+      // Continue polling.
+      pollTestJob();
+    }catch(e){
+      console.error('pollTestJob failed:',e);
+      ppTestPollTimer=null;
+      ppTestAllRunning=false;
+      const btn=document.getElementById('ppTestAllBtn');
+      if(btn)btn.disabled=false;
+    }
+  },1500);
+}
 
-  // Auto-remove failed proxies if the option is checked
-  let removedCount=0;
-  if(autoRemove&&failedIds.length>0){
-    progressText.textContent=`正在删除 ${failedIds.length} 个失败代理...`;
-    const removePromises=failedIds.map(async id=>{
-      try{
-        const r=await fetch(API+'/admin/api/proxy-pool/proxy',{
-          method:'DELETE',headers:authHeaders(),
-          body:JSON.stringify({id}),
-        });
-        if(r.ok){removedCount++;delete ppTestResults[id];}
-      }catch(e){/* ignore individual removal errors */}
-    });
-    await Promise.all(removePromises);
-    // Reload pool state to reflect removals
-    await loadProxyPool();
-  }
+let ppJobFinishedNotified=false;
 
-  ppTestAllRunning=false;
-  if(btn)btn.disabled=false;
-  progress.style.display='none';
-  let msg=`检测完成：共 ${total} 个，成功 ${okCount}，失败 ${failCount}`;
-  if(autoRemove&&removedCount>0){
-    msg+=`；已自动删除 ${removedCount} 个失败代理`;
-  }
-  toast(msg,okCount>0?'success':'warn');
+// Check on page load if a background test job is already running (e.g. user
+// closed the page and reopened it). If so, resume polling.
+async function checkRunningTestJob(){
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/test-status',{headers:authHeaders()});
+    if(!r.ok)return;
+    const state=await r.json();
+    if(state.running){
+      ppTestAllRunning=true;
+      ppJobFinishedNotified=false;
+      const btn=document.getElementById('ppTestAllBtn');
+      if(btn)btn.disabled=true;
+      pollTestJob();
+    }else if(state.total>0&&state.finishedAt){
+      // A previous job completed — show its results in the table.
+      if(state.results){
+        for(const[id,result]of Object.entries(state.results)){
+          ppTestResults[id]=result;
+        }
+      }
+      renderProxyPool();
+    }
+  }catch(e){/* ignore — non-critical */}
 }
 </script>
 

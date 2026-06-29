@@ -25,6 +25,9 @@ import {
   refreshFromSources,
   removeProxy,
   clearProxies,
+  startTestJob,
+  getTestJobState,
+  cancelTestJob,
 } from "../proxy/proxy-pool.js";
 // Inline the dashboard HTML at build time so it works inside a
 // `bun build --compile` single-file executable. Runtime `readFileSync`
@@ -2624,6 +2627,73 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     } catch (err) {
       return errorResponse(500, "test_failed", (err as Error).message);
     }
+  }
+
+  // Start a background test-all job (v0.2.1.1+)
+  // The job runs entirely on the server — closing the browser tab does NOT
+  // stop it. The dashboard polls GET /test-status for progress.
+  //
+  // Body: { batchSize?: number, autoRemove?: boolean, provider?: "zai"|"bigmodel" }
+  // Returns: the initial job state (running: true)
+  if (path === "/admin/api/proxy-pool/test-all" && method === "POST") {
+    try {
+      const parsed = await readJsonBody<{ batchSize?: number; autoRemove?: boolean; provider?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
+
+      // Determine test target (provider's base host origin).
+      const providerId = body.provider === "bigmodel" ? "bigmodel" : "zai";
+      const providerCfg = opts.config.providers[providerId];
+      let testTarget: string;
+      try {
+        const u = new URL(providerCfg.anthropicBase);
+        testTarget = `${u.protocol}//${u.host}`;
+      } catch {
+        testTarget = providerId === "bigmodel"
+          ? "https://open.bigmodel.cn"
+          : "https://api.z.ai";
+      }
+
+      const state = await startTestJob({
+        batchSize: body.batchSize,
+        autoRemove: body.autoRemove,
+        fetchImpl: opts.fetchImpl,
+        testTarget,
+      });
+      appendLog("info", `Proxy pool test-all started: ${state.total} proxies, batch=${state.batchSize}, autoRemove=${state.autoRemove}`);
+      return jsonResp(state);
+    } catch (err) {
+      return errorResponse(500, "test_failed", (err as Error).message);
+    }
+  }
+
+  // Poll background test-all job status (v0.2.1.1+)
+  // Returns the current job state, or { running: false, total: 0, ... } if
+  // no job has ever run.
+  if (path === "/admin/api/proxy-pool/test-status" && method === "GET") {
+    const state = getTestJobState();
+    if (!state) {
+      return jsonResp({
+        running: false,
+        total: 0,
+        tested: 0,
+        okCount: 0,
+        failCount: 0,
+        removedCount: 0,
+        batchSize: 0,
+        autoRemove: false,
+        startedAt: 0,
+        results: {},
+      });
+    }
+    return jsonResp(state);
+  }
+
+  // Cancel the current background test-all job (v0.2.1.1+)
+  if (path === "/admin/api/proxy-pool/test-cancel" && method === "POST") {
+    cancelTestJob();
+    appendLog("info", "Proxy pool test-all cancelled by admin");
+    return jsonResp({ ok: true });
   }
 
   return null; // Not an admin route

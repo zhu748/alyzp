@@ -17,6 +17,9 @@ import {
   getMaxRotations,
   getCurrentWorkingProxy,
   setCurrentWorkingProxy,
+  startTestJob,
+  getTestJobState,
+  cancelTestJob,
   scheduleAutoRefresh,
   _resetForTesting,
   _poolFilePath,
@@ -475,4 +478,138 @@ test("scheduleAutoRefresh: schedules timer when enabled + URLs configured", () =
     rotateOnGatewayBlock: true,
     maxRotations: 3,
   });
+});
+
+// --- Background test job ---
+
+test("startTestJob: runs in background and updates state", async () => {
+  await importFromText("1.1.1.1:8080\n2.2.2.2:8080\n3.3.3.3:8080");
+  await updatePoolConfig({ enabled: true });
+
+  // Mock fetch that succeeds for all proxies.
+  const mockFetch = async () => new Response("", { status: 200 });
+
+  const state = await startTestJob({
+    batchSize: 2,
+    autoRemove: false,
+    fetchImpl: mockFetch as unknown as typeof fetch,
+    testTarget: "https://example.com",
+  });
+
+  expect(state.running).toBe(true);
+  expect(state.total).toBe(3);
+  expect(state.batchSize).toBe(2);
+
+  // Wait for the job to finish (poll getTestJobState).
+  let final = state;
+  for (let i = 0; i < 50; i++) {
+    final = getTestJobState()!;
+    if (!final.running) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  expect(final.running).toBe(false);
+  expect(final.tested).toBe(3);
+  expect(final.okCount).toBe(3);
+  expect(final.failCount).toBe(0);
+  expect(Object.keys(final.results)).toHaveLength(3);
+});
+
+test("startTestJob: autoRemove deletes failed proxies", async () => {
+  await importFromText("1.1.1.1:8080\n2.2.2.2:8080");
+  await updatePoolConfig({ enabled: true });
+
+  // Mock fetch that fails for all proxies (throws).
+  const mockFetch = async () => { throw new Error("ECONNREFUSED"); };
+
+  const state = await startTestJob({
+    batchSize: 5,
+    autoRemove: true,
+    fetchImpl: mockFetch as unknown as typeof fetch,
+    testTarget: "https://example.com",
+  });
+
+  expect(state.total).toBe(2);
+
+  // Wait for the job to finish.
+  let final = state;
+  for (let i = 0; i < 50; i++) {
+    final = getTestJobState()!;
+    if (!final.running) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  expect(final.running).toBe(false);
+  expect(final.failCount).toBe(2);
+  expect(final.removedCount).toBe(2); // both failed proxies auto-removed
+
+  // Verify the pool is now empty.
+  const poolState = await getPoolState();
+  expect(poolState.proxies).toHaveLength(0);
+});
+
+test("startTestJob: idempotent — returns existing job if already running", async () => {
+  await importFromText("1.1.1.1:8080");
+  await updatePoolConfig({ enabled: true });
+
+  // Mock fetch that takes a bit to resolve.
+  const mockFetch = async () => {
+    await new Promise(r => setTimeout(r, 100));
+    return new Response("", { status: 200 });
+  };
+
+  const state1 = await startTestJob({
+    batchSize: 1,
+    fetchImpl: mockFetch as unknown as typeof fetch,
+    testTarget: "https://example.com",
+  });
+
+  // Immediately start again — should return the same running job.
+  const state2 = await startTestJob({
+    batchSize: 1,
+    fetchImpl: mockFetch as unknown as typeof fetch,
+    testTarget: "https://example.com",
+  });
+
+  expect(state2.running).toBe(true);
+  expect(state2.startedAt).toBe(state1.startedAt);
+
+  // Wait for it to finish.
+  for (let i = 0; i < 50; i++) {
+    if (!getTestJobState()!.running) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+});
+
+test("cancelTestJob: stops the running job", async () => {
+  await importFromText("1.1.1.1:8080\n2.2.2.2:8080\n3.3.3.3:8080");
+  await updatePoolConfig({ enabled: true });
+
+  // Mock fetch that takes a bit to resolve.
+  const mockFetch = async () => {
+    await new Promise(r => setTimeout(r, 100));
+    return new Response("", { status: 200 });
+  };
+
+  await startTestJob({
+    batchSize: 1,
+    fetchImpl: mockFetch as unknown as typeof fetch,
+    testTarget: "https://example.com",
+  });
+
+  expect(getTestJobState()!.running).toBe(true);
+  cancelTestJob();
+
+  // Wait a moment for the job to notice the cancel.
+  await new Promise(r => setTimeout(r, 200));
+  // The job should have stopped (running=false) after the current batch.
+  for (let i = 0; i < 50; i++) {
+    if (!getTestJobState()!.running) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  expect(getTestJobState()!.running).toBe(false);
+});
+
+test("getTestJobState: returns null when no job has ever run", () => {
+  expect(getTestJobState()).toBeNull();
 });

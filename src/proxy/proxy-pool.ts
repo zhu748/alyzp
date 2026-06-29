@@ -761,6 +761,173 @@ export async function initPool(fetchImpl: typeof fetch = fetch): Promise<void> {
 }
 
 // --------------------------------------------------------------------
+// Background test job (server-side, survives page close)
+// --------------------------------------------------------------------
+
+/**
+ * State of a background test-all job. The job runs entirely on the server —
+ * the dashboard starts it via POST /admin/api/proxy-pool/test-all and polls
+ * GET /admin/api/proxy-pool/test-status for progress. Closing the browser
+ * tab does NOT stop the job.
+ */
+export interface TestJobState {
+  /** Whether the job is currently running. */
+  running: boolean;
+  /** Total proxies to test (captured at job start). */
+  total: number;
+  /** Number of proxies tested so far. */
+  tested: number;
+  /** Number of successful tests so far. */
+  okCount: number;
+  /** Number of failed tests so far. */
+  failCount: number;
+  /** Number of failed proxies auto-removed (0 if autoRemove is off). */
+  removedCount: number;
+  /** Batch size (concurrent tests per batch). */
+  batchSize: number;
+  /** Whether failed proxies are auto-removed after the job. */
+  autoRemove: boolean;
+  /** Job start time (Unix ms). */
+  startedAt: number;
+  /** Job finish time (Unix ms, set when job completes). */
+  finishedAt?: number;
+  /** Per-proxy results: { [proxyId]: { ok, latencyMs, status?, error? } }. */
+  results: Record<string, { ok: boolean; latencyMs: number; status?: number; error?: string }>;
+  /** Error message if the job itself failed (rare). */
+  error?: string;
+}
+
+let currentTestJob: TestJobState | null = null;
+
+/** Get the current test job state (for polling). Null if no job has ever run. */
+export function getTestJobState(): TestJobState | null {
+  return currentTestJob ? { ...currentTestJob, results: { ...currentTestJob.results } } : null;
+}
+
+/**
+ * Start a background test-all job. If a job is already running, returns its
+ * state without starting a new one (idempotent).
+ *
+ * The job runs fire-and-forget on the server. The caller gets back the
+ * initial state immediately and can poll `getTestJobState()` for progress.
+ *
+ * @param options batchSize (1-50, default 5), autoRemove (default false),
+ *                fetchImpl (for testing), testTarget (override target URL).
+ * @returns The job state.
+ */
+export async function startTestJob(options: {
+  batchSize?: number;
+  autoRemove?: boolean;
+  fetchImpl?: typeof fetch;
+  testTarget?: string;
+}): Promise<TestJobState> {
+  // If a job is already running, return its state (don't start a duplicate).
+  if (currentTestJob && currentTestJob.running) {
+    return getTestJobState()!;
+  }
+
+  const pool = await readPool();
+  const proxies = pool.proxies;
+  const batchSize = Math.max(1, Math.min(50, options.batchSize ?? 5));
+  const autoRemove = options.autoRemove ?? false;
+
+  const job: TestJobState = {
+    running: true,
+    total: proxies.length,
+    tested: 0,
+    okCount: 0,
+    failCount: 0,
+    removedCount: 0,
+    batchSize,
+    autoRemove,
+    startedAt: Date.now(),
+    results: {},
+  };
+  currentTestJob = job;
+
+  // Fire-and-forget — run the job in the background. Errors are captured
+  // into job.error so the dashboard can surface them.
+  runTestJob(job, proxies, options.fetchImpl ?? fetch, options.testTarget).catch(e => {
+    job.error = (e as Error).message;
+    job.running = false;
+    job.finishedAt = Date.now();
+  });
+
+  return getTestJobState()!;
+}
+
+/**
+ * Internal: run the test job. Processes proxies in batches of `batchSize`,
+ * updating `job` in real-time so pollers see progress. After all batches
+ * complete, auto-removes failed proxies if `autoRemove` is true.
+ */
+async function runTestJob(
+  job: TestJobState,
+  proxies: PoolProxy[],
+  fetchImpl: typeof fetch,
+  testTargetOverride?: string,
+): Promise<void> {
+  const failedIds: string[] = [];
+  const total = proxies.length;
+
+  for (let i = 0; i < total; i += job.batchSize) {
+    // If job was cancelled (a new job started), stop early.
+    if (!job.running) return;
+
+    const batch = proxies.slice(i, i + job.batchSize);
+    const promises = batch.map(async p => {
+      const target = testTargetOverride ?? "https://api.z.ai";
+      const started = Date.now();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      try {
+        const resp = await fetchImpl(target, {
+          method: "HEAD",
+          signal: ctrl.signal,
+          redirect: "follow",
+          ...(p.url ? { proxy: p.url } : {}),
+        } as any);
+        clearTimeout(timer);
+        const latencyMs = Date.now() - started;
+        const result = { ok: true, latencyMs, status: resp.status };
+        job.results[p.id] = result;
+        job.okCount++;
+      } catch (err) {
+        clearTimeout(timer);
+        const latencyMs = Date.now() - started;
+        const errMsg = (err as Error).message || String(err);
+        const isTimeout = ctrl.signal.aborted || /abort/i.test(errMsg);
+        const result = { ok: false, latencyMs, error: isTimeout ? "Connection timed out after 10s" : errMsg };
+        job.results[p.id] = result;
+        job.failCount++;
+        failedIds.push(p.id);
+      }
+      job.tested++;
+    });
+    await Promise.all(promises);
+  }
+
+  // Auto-remove failed proxies if enabled.
+  if (job.autoRemove && failedIds.length > 0) {
+    const removePromises = failedIds.map(async id => {
+      const ok = await removeProxy(id);
+      if (ok) job.removedCount++;
+    });
+    await Promise.all(removePromises);
+  }
+
+  job.running = false;
+  job.finishedAt = Date.now();
+}
+
+/** Cancel the current test job (if any). The job stops after the current batch. */
+export function cancelTestJob(): void {
+  if (currentTestJob) {
+    currentTestJob.running = false;
+  }
+}
+
+// --------------------------------------------------------------------
 // Test helpers
 // --------------------------------------------------------------------
 
@@ -774,6 +941,7 @@ export function _resetForTesting(): void {
   }
   roundRobinCursor = 0;
   currentWorkingProxy = null;
+  currentTestJob = null;
 }
 
 /** @internal Get the pool file path (for tests). */
