@@ -15,6 +15,8 @@ import {
   pickProxy,
   markProxyFailed,
   getMaxRotations,
+  getCurrentWorkingProxy,
+  setCurrentWorkingProxy,
   scheduleAutoRefresh,
   _resetForTesting,
   _poolFilePath,
@@ -330,21 +332,40 @@ test("pickProxy: returns null when pool is disabled", async () => {
   expect(p).toBeNull();
 });
 
-test("pickProxy: round-robins through enabled pool", async () => {
+test("pickProxy: sticky behavior — reuses the same proxy until it fails", async () => {
   await importFromText("1.1.1.1:8080\n2.2.2.2:8080\n3.3.3.3:8080");
   await updatePoolConfig({ enabled: true });
-  const picks: (string | null)[] = [];
-  for (let i = 0; i < 7; i++) {
-    picks.push(await pickProxy());
-  }
-  // Should cycle through 3 proxies (round-robin), wrapping on the 4th pick.
-  expect(picks.slice(0, 3).sort()).toEqual([
-    "http://1.1.1.1:8080",
-    "http://2.2.2.2:8080",
-    "http://3.3.3.3:8080",
-  ]);
-  // The 4th pick should match the 1st.
-  expect(picks[3]).toBe(picks[0]);
+
+  // First pick returns one proxy and makes it sticky.
+  const first = await pickProxy();
+  expect(first).not.toBeNull();
+
+  // Subsequent picks return the SAME sticky proxy (no round-robin).
+  const second = await pickProxy();
+  const third = await pickProxy();
+  expect(second).toBe(first);
+  expect(third).toBe(first);
+
+  // After the sticky proxy fails, the next pick advances to a new one.
+  await markProxyFailed(first!);
+  const next = await pickProxy();
+  expect(next).not.toBeNull();
+  expect(next).not.toBe(first);
+});
+
+test("pickProxy: round-robins when sticky proxy is excluded", async () => {
+  await importFromText("1.1.1.1:8080\n2.2.2.2:8080\n3.3.3.3:8080");
+  await updatePoolConfig({ enabled: true });
+
+  // First pick — becomes sticky.
+  const first = await pickProxy();
+  // Exclude the sticky proxy (simulating WAF rotation) — should get a different one.
+  const exclude = new Set<string>([first!]);
+  const second = await pickProxy(exclude);
+  expect(second).not.toBeNull();
+  expect(second).not.toBe(first);
+  // The second proxy is now sticky.
+  expect(getCurrentWorkingProxy()).toBe(second);
 });
 
 test("pickProxy: skips excluded URLs", async () => {
@@ -372,6 +393,39 @@ test("markProxyFailed: increments failure counter", async () => {
   await markProxyFailed("http://1.1.1.1:8080");
   const state = await getPoolState();
   expect(state.proxies[0].failures).toBe(2);
+});
+
+test("markProxyFailed: clears sticky proxy when it fails", async () => {
+  await importFromText("1.1.1.1:8080\n2.2.2.2:8080");
+  await updatePoolConfig({ enabled: true });
+  const first = await pickProxy();
+  expect(getCurrentWorkingProxy()).toBe(first);
+  // Fail the sticky proxy — sticky state should clear.
+  await markProxyFailed(first!);
+  expect(getCurrentWorkingProxy()).toBeNull();
+  // Next pick should return a DIFFERENT proxy (the failed one is still in
+  // the pool but not sticky).
+  const next = await pickProxy();
+  expect(next).not.toBe(first);
+});
+
+test("removeProxy: clears sticky proxy when it's removed", async () => {
+  await importFromText("1.1.1.1:8080\n2.2.2.2:8080");
+  await updatePoolConfig({ enabled: true });
+  const first = await pickProxy();
+  expect(getCurrentWorkingProxy()).toBe(first);
+  const state = await getPoolState();
+  const stickyEntry = state.proxies.find(p => p.url === first);
+  // Remove the sticky proxy — sticky state should clear.
+  await removeProxy(stickyEntry!.id);
+  expect(getCurrentWorkingProxy()).toBeNull();
+});
+
+test("setCurrentWorkingProxy: explicitly sets the sticky proxy", () => {
+  setCurrentWorkingProxy("http://9.9.9.9:8080");
+  expect(getCurrentWorkingProxy()).toBe("http://9.9.9.9:8080");
+  setCurrentWorkingProxy(null);
+  expect(getCurrentWorkingProxy()).toBeNull();
 });
 
 // --- updatePoolConfig ---

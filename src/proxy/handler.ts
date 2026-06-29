@@ -26,7 +26,7 @@ import { translateResponseAnthropicToResponses, anthropicSseToResponsesSse } fro
 import { saveTurn } from "../translator/responses-store.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import { pickProxy, markProxyFailed, getMaxRotations } from "./proxy-pool.js";
+import { pickProxy, markProxyFailed, getMaxRotations, getCurrentWorkingProxy, setCurrentWorkingProxy } from "./proxy-pool.js";
 import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
 import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
@@ -458,20 +458,28 @@ export async function proxyRequest(
       signal: ctrl.signal,
     };
     // === Proxy resolution (v0.2.2+ global pool) ===
-    // Priority: cred.proxy (per-account) > pool (round-robin) > direct.
+    // Priority: cred.proxy (per-account) > pool (sticky/round-robin) > direct.
     if (cred.proxy) {
       fetchOpts.proxy = cred.proxy;
     } else {
       // Pool consultation is best-effort: if the pool is disabled or empty,
       // pickProxy returns null and we fall through to a direct connection.
-      // The `currentRequestProxy` value persists across retries of THIS
-      // request unless the WAF-rotation path explicitly advances it.
+      //
+      // Sticky behavior: pickProxy returns the current "working" proxy if
+      // one is set (from a previous successful request), so subsequent
+      // requests reuse the same proxy until it fails. On failure
+      // (markProxyFailed), the sticky proxy is cleared and the next pickProxy
+      // advances to a new one.
       if (!currentRequestProxy) {
         try {
           const picked = await pickProxy(triedPoolProxies);
           if (picked) {
             currentRequestProxy = picked;
             triedPoolProxies.add(picked);
+            // Log which proxy is being used for this request. Sticky proxies
+            // (reused from a previous success) are marked accordingly.
+            const sticky = getCurrentWorkingProxy() === picked;
+            console.log(`${reqId} proxy: ${picked}${sticky ? " (sticky)" : ""}`);
           }
         } catch (e) {
           // Pool must NEVER break the request — log and fall through.
@@ -1320,6 +1328,23 @@ export async function proxyRequest(
         "x-should-not-retry": "1",
       },
     });
+  }
+
+  // === Sticky proxy: mark the current pool proxy as "working" ===
+  // If this request used a pool proxy (not cred.proxy) and the response is
+  // successful (2xx), make it the sticky proxy for future requests. This
+  // implements "后面请求也要记住这个代理继续使用" — once a proxy works,
+  // subsequent requests reuse it until it fails.
+  //
+  // We do NOT clear the sticky state on non-2xx responses here — that's
+  // already handled by markProxyFailed in the WAF rotation path. For other
+  // 4xx/5xx errors (quota, auth, etc.), we leave the sticky proxy in place
+  // because the error is likely account-specific, not proxy-specific.
+  if (currentRequestProxy && !cred.proxy && upstreamResp.status >= 200 && upstreamResp.status < 300) {
+    if (getCurrentWorkingProxy() !== currentRequestProxy) {
+      setCurrentWorkingProxy(currentRequestProxy);
+      console.log(`${reqId} proxy sticky: ${currentRequestProxy} (will reuse for future requests)`);
+    }
   }
 
   const isSSEUpstream = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;

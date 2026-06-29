@@ -1,8 +1,8 @@
 # zcode-proxy 使用说明
 
-> **v0.2.1.1 — 全局代理池 + WAF 拦截自动轮询重试**
+> **v0.2.1.1 — 全局代理池 + WAF 拦截自动轮询重试 + 粘性代理 + 代理检测**
 >
-> 新增全局共享出站代理池，支持手动导入、txt 文件上传、URL 一键导入与定时自动刷新。当请求遇到 405/阿里云 WAF 拦截时，自动轮询切换到池中其他代理重试。
+> 新增全局共享出站代理池，支持手动导入、txt 文件上传、URL 一键导入与定时自动刷新。当请求遇到 405/阿里云 WAF 拦截时，自动轮询切换到池中其他代理重试。粘性代理机制让可用代理持续复用，直到失败才切换。
 >
 > **本次改动**
 >
@@ -15,32 +15,58 @@
 > - 上传 txt 文件
 > - URL 一键导入（如 `https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.txt`）
 >
-> 自动定时刷新（默认 5 分钟，可配 0 = 禁用）。手动刷新返回新增/删除/总数统计。
+> 自动定时刷新（默认 5 分钟，可配 0 = 禁用）。手动刷新返回新增/删除/总数统计。刷新失败时保留该来源已有代理（不会因网络抖动清空可用代理）。
 >
-> **2. WAF 拦截自动轮询重试**
+> **2. 粘性代理（Sticky Proxy）**
 >
-> 当上游返回 405/403/200+HTML 且检测到阿里云 WAF 拦截特征时，自动切换到池中其他代理重试（最多 `maxRotations` 次，默认 3）。每次轮询的代理会被标记失败次数，方便在面板识别坏代理。轮询在初始请求和 retry 循环中都生效。
+> 代理池采用粘性策略：一旦某个代理请求成功，它会被标记为"当前使用代理"，后续所有请求继续复用它——直到它失败（405/WAF/网络错误）才轮询到下一个。这避免了每个请求都换代理导致的连接浪费，同时保证故障时自动切换。
 >
-> **3. 管理面板新增「代理池」栏目**
+> 管理面板「代理池」页面顶部会显示当前粘性代理，列表中对应行标记"使用中"徽章。
+>
+> **3. WAF 拦截自动轮询重试**
+>
+> 当上游返回 405/403/200+HTML 且检测到阿里云 WAF 拦截特征时，自动切换到池中其他代理重试（最多 `maxRotations` 次，默认 3）。每次轮询的代理会被标记失败次数。轮询在初始请求和 retry 循环中都生效。
+>
+> **4. 代理检测功能**
+>
+> - **单个检测**：代理列表每行有"检测"按钮，对目标提供商域名做 HEAD 请求验证代理连通性，显示延迟或错误
+> - **全部检测**：一键检测池中所有代理，支持配置分批大小（每批并发数，默认 5），检测进度实时显示，完成后汇总成功/失败数
+>
+> **5. 代理使用日志**
+>
+> 每个请求在日志中显示当前使用的代理（标记 `(sticky)` 表示复用粘性代理）：
+> ```
+> 001 >>> POST /v1/messages (anthropic)
+> 001 proxy: http://1.2.3.4:8080 (sticky)
+> 001 proxy sticky: http://1.2.3.4:8080 (will reuse for future requests)
+> ```
+> WAF 轮询时显示切换过程：
+> ```
+> 001 WAF rotation 1/3: switching to proxy socks5://5.6.7.8:1080
+> 001 WAF rotation 1 succeeded — request now proceeds with proxy socks5://5.6.7.8:1080
+> ```
+>
+> **6. 管理面板新增「代理池」栏目**
 >
 > 侧边栏新增「代理池」页面，包含：
 > - 配置卡片（启用开关、刷新间隔、WAF 轮询开关与次数、来源 URL 列表）
 > - 导入卡片（URL 导入、文本粘贴、txt 文件上传、追加/替换模式）
-> - 代理列表表格（URL、来源、添加时间、失败次数、最近使用、删除）
-> - 「立即刷新全部来源」按钮，刷新后 toast 显示新增/删除/总数
+> - 代理列表表格（URL、来源、检测状态、失败次数、检测/删除按钮）
+> - 当前粘性代理指示器
+> - 「全部检测」按钮（分批并发）+ 「刷新来源」+ 「清空全部」
 >
-> **4. Bug 修复**
+> **7. Bug 修复**
 >
 > - 修复 `refreshFromSources` 在某个 URL 来源拉取失败时会清空该来源已有代理的 bug（现在保留已有代理，只跳过本次拉取）
 > - WAF 轮询循环现在正确读取 `maxRotations` 配置（之前硬编码为 5）
 >
-> **5. socks4/socks4a 协议支持**
+> **8. socks4/socks4a 协议支持**
 >
 > 单账号代理设置和代理池都新增 `socks4://` 和 `socks4a://` 协议支持（Bun 原生 fetch 已支持）。单账号代理弹窗新增 SOCKS4 和 SOCKS4a 选项。
 >
-> **6. Admin API 新增 7 个端点**
+> **9. Admin API 新增 8 个端点**
 >
-> `GET /admin/api/proxy-pool`、`PUT /admin/api/proxy-pool/config`、`POST /admin/api/proxy-pool/import-text`、`POST /admin/api/proxy-pool/import-url`、`POST /admin/api/proxy-pool/refresh`、`DELETE /admin/api/proxy-pool/proxy`、`POST /admin/api/proxy-pool/clear`
+> `GET /admin/api/proxy-pool`、`PUT /admin/api/proxy-pool/config`、`POST /admin/api/proxy-pool/import-text`、`POST /admin/api/proxy-pool/import-url`、`POST /admin/api/proxy-pool/refresh`、`DELETE /admin/api/proxy-pool/proxy`、`POST /admin/api/proxy-pool/clear`、`POST /admin/api/proxy-pool/test-one`
 
 ---
 

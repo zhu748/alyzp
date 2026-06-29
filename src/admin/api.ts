@@ -2549,6 +2549,83 @@ async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<
     }
   }
 
+  // Test a single pool proxy by id (v0.2.1.1+)
+  // Does a HEAD request to the configured provider's base URL through the
+  // proxy identified by `id`. Returns ok:true with latency on any HTTP
+  // response (even 4xx/5xx means the proxy is reachable); ok:false on
+  // network-level failures (timeout, connection refused, etc.).
+  //
+  // Body: { id: string, provider?: "zai"|"bigmodel" }
+  // Returns: { ok: true, status, latencyMs, target, url } on success
+  //          { ok: false, error, latencyMs, target, url } on failure
+  if (path === "/admin/api/proxy-pool/test-one" && method === "POST") {
+    try {
+      const parsed = await readJsonBody<{ id?: string; provider?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
+      if (typeof body.id !== "string" || !body.id.trim()) {
+        return errorResponse(400, "missing_param", "id is required");
+      }
+      const state = await getPoolState();
+      const entry = state.proxies.find(p => p.id === body.id);
+      if (!entry) {
+        return errorResponse(404, "not_found", "Proxy not found in pool");
+      }
+      const proxyUrl = entry.url;
+
+      // Determine test target (provider's base host origin).
+      const providerId = body.provider === "bigmodel" ? "bigmodel" : "zai";
+      const providerCfg = opts.config.providers[providerId];
+      let target: string;
+      try {
+        const u = new URL(providerCfg.anthropicBase);
+        target = `${u.protocol}//${u.host}`;
+      } catch {
+        target = providerId === "bigmodel"
+          ? "https://open.bigmodel.cn"
+          : "https://api.z.ai";
+      }
+
+      const started = Date.now();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10_000);
+      const fetchImpl = opts.fetchImpl ?? fetch;
+      try {
+        const resp = await fetchImpl(target, {
+          method: "HEAD",
+          signal: ctrl.signal,
+          redirect: "follow",
+          ...(proxyUrl ? { proxy: proxyUrl } : {}),
+        } as any);
+        clearTimeout(timer);
+        const latencyMs = Date.now() - started;
+        return jsonResp({
+          ok: true,
+          id: body.id,
+          url: proxyUrl,
+          status: resp.status,
+          latencyMs,
+          target,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        const latencyMs = Date.now() - started;
+        const errMsg = (err as Error).message || String(err);
+        const isTimeout = ctrl.signal.aborted || /abort/i.test(errMsg);
+        return jsonResp({
+          ok: false,
+          id: body.id,
+          url: proxyUrl,
+          error: isTimeout ? "Connection timed out after 10s" : errMsg,
+          latencyMs,
+          target,
+        });
+      }
+    } catch (err) {
+      return errorResponse(500, "test_failed", (err as Error).message);
+    }
+  }
+
   return null; // Not an admin route
 }
 

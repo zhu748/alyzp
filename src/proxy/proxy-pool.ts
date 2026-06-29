@@ -144,6 +144,21 @@ let cachedMtimeMs = -1;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let roundRobinCursor = 0;
 
+/**
+ * Sticky proxy — the proxy that's currently "working" and should be reused
+ * for subsequent requests until it fails (405/WAF/network error). When set,
+ * `pickProxy` returns this proxy instead of advancing the round-robin cursor.
+ *
+ * Set by `pickProxy` whenever it picks a new proxy. Cleared by
+ * `markProxyFailed` when the sticky proxy fails, and by `removeProxy` /
+ * `clearProxies` when the sticky proxy is removed from the pool.
+ *
+ * This implements the user's "后面请求也要记住这个代理继续使用 直到代理
+ * 失效或405报错继续轮循" requirement: a working proxy is sticky across
+ * requests, rotation only happens on failure.
+ */
+let currentWorkingProxy: string | null = null;
+
 const poolMutex = createMutex();
 
 // --------------------------------------------------------------------
@@ -312,6 +327,7 @@ export async function getPoolState(): Promise<{
   proxies: PoolProxy[];
   lastRefreshAt?: number;
   lastRefreshResult?: RefreshResult;
+  currentWorkingProxy: string | null;
 }> {
   const pool = await readPool();
   return {
@@ -319,6 +335,7 @@ export async function getPoolState(): Promise<{
     proxies: pool.proxies.map(p => ({ ...p })),
     lastRefreshAt: pool.lastRefreshAt,
     lastRefreshResult: pool.lastRefreshResult,
+    currentWorkingProxy,
   };
 }
 
@@ -573,9 +590,14 @@ export async function refreshFromSources(
 export async function removeProxy(id: string): Promise<boolean> {
   return poolMutex.run(async () => {
     const pool = await readPool();
+    const entry = pool.proxies.find(p => p.id === id);
     const before = pool.proxies.length;
     pool.proxies = pool.proxies.filter(p => p.id !== id);
     if (pool.proxies.length === before) return false;
+    // If the removed proxy was sticky, clear the sticky state.
+    if (entry && currentWorkingProxy === entry.url) {
+      currentWorkingProxy = null;
+    }
     await writePool(pool);
     return true;
   });
@@ -583,6 +605,8 @@ export async function removeProxy(id: string): Promise<boolean> {
 
 /** Clear all proxies (config is preserved). */
 export async function clearProxies(): Promise<{ removed: number }> {
+  // Clear sticky state — no proxies left to be sticky.
+  currentWorkingProxy = null;
   return poolMutex.run(async () => {
     const pool = await readPool();
     const removed = pool.proxies.length;
@@ -593,8 +617,13 @@ export async function clearProxies(): Promise<{ removed: number }> {
 }
 
 /**
- * Pick the next proxy to use (round-robin). Returns null if the pool is
- * disabled or empty.
+ * Pick the next proxy to use. Returns null if the pool is disabled or empty.
+ *
+ * **Sticky behavior**: if a `currentWorkingProxy` is set (from a previous
+ * successful pick), it's returned for every subsequent call — UNLESS it's
+ * in the `excludeUrls` set (caller is rotating away from it after a failure)
+ * or it's no longer in the pool. This makes a working proxy persist across
+ * requests; rotation only happens when the sticky proxy fails.
  *
  * @param excludeUrls Optional set of URLs to skip (used during rotation
  *   after a gateway block — we don't want to retry the same proxy that
@@ -605,18 +634,51 @@ export async function pickProxy(excludeUrls?: Set<string>): Promise<string | nul
   if (!pool.config.enabled) return null;
   if (pool.proxies.length === 0) return null;
 
-  // Try each proxy starting from the cursor, skipping excluded ones.
+  const poolUrls = new Set(pool.proxies.map(p => p.url));
+
+  // Sticky: if currentWorkingProxy is still valid (in pool + not excluded),
+  // return it without advancing the cursor.
+  if (currentWorkingProxy && poolUrls.has(currentWorkingProxy)) {
+    if (!excludeUrls || !excludeUrls.has(currentWorkingProxy)) {
+      return currentWorkingProxy;
+    }
+    // Sticky proxy is excluded (caller is rotating away from it). Fall
+    // through to pick a new one.
+  } else {
+    // Sticky proxy is stale (removed from pool). Clear it.
+    currentWorkingProxy = null;
+  }
+
+  // Advance round-robin to find a new proxy.
   const n = pool.proxies.length;
   for (let i = 0; i < n; i++) {
     const idx = (roundRobinCursor + i) % n;
     const candidate = pool.proxies[idx];
     if (excludeUrls && excludeUrls.has(candidate.url)) continue;
-    // Advance cursor past this pick so the next request gets a different one.
+    // Found a new proxy — make it sticky.
     roundRobinCursor = (idx + 1) % n;
+    currentWorkingProxy = candidate.url;
     return candidate.url;
   }
   // All excluded — return null (caller should fall through to direct/no-proxy).
   return null;
+}
+
+/**
+ * Get the current sticky (working) proxy for diagnostics/logging. Returns
+ * null if no proxy is currently sticky.
+ */
+export function getCurrentWorkingProxy(): string | null {
+  return currentWorkingProxy;
+}
+
+/**
+ * Explicitly set the current working proxy. Used by the handler when a
+ * request succeeds through a pool proxy — the proxy that served the
+ * successful request becomes sticky for future requests.
+ */
+export function setCurrentWorkingProxy(url: string | null): void {
+  currentWorkingProxy = url;
 }
 
 /**
@@ -631,10 +693,18 @@ export async function getMaxRotations(): Promise<number> {
 
 /**
  * Mark a proxy as failed (increment its failure counter). Called by the
- * handler when a request via this proxy hit a 405 / WAF block. Used for
- * diagnostics and future deprioritization; the proxy is NOT removed.
+ * handler when a request via this proxy hit a 405 / WAF block / network
+ * error. Used for diagnostics and future deprioritization; the proxy is
+ * NOT removed from the pool.
+ *
+ * If the failed proxy is the current sticky proxy, the sticky state is
+ * cleared so the next `pickProxy` call advances to a new proxy.
  */
 export async function markProxyFailed(url: string): Promise<void> {
+  // Clear sticky state if the failed proxy was sticky.
+  if (currentWorkingProxy === url) {
+    currentWorkingProxy = null;
+  }
   await poolMutex.run(async () => {
     const pool = await readPool();
     const entry = pool.proxies.find(p => p.url === url);
@@ -703,6 +773,7 @@ export function _resetForTesting(): void {
     refreshTimer = null;
   }
   roundRobinCursor = 0;
+  currentWorkingProxy = null;
 }
 
 /** @internal Get the pool file path (for tests). */

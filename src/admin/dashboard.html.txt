@@ -2104,10 +2104,18 @@ td input{font-family:var(--font-mono)}
               <span class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></span>
               代理列表 <span class="tag" id="ppPoolCount">0</span>
             </div>
-            <div style="display:flex;gap:8px;align-items:center">
-              <button class="btn btn-primary btn-sm" onclick="refreshProxyPool()">
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:4px">
+                <label style="font-size:12px;color:var(--text-3)">分批:</label>
+                <input id="ppBatchSize" type="number" min="1" max="50" value="5" style="width:60px;font-size:12px" title="全部检测时每批并发数">
+              </div>
+              <button class="btn btn-primary btn-sm" onclick="testAllProxies()" id="ppTestAllBtn">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                全部检测
+              </button>
+              <button class="btn btn-ghost btn-sm" onclick="refreshProxyPool()">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                立即刷新全部来源
+                刷新来源
               </button>
               <button class="btn btn-ghost btn-sm" onclick="clearProxyPool()">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
@@ -2116,16 +2124,24 @@ td input{font-family:var(--font-mono)}
             </div>
           </div>
           <div class="card-body" style="padding-bottom:0">
+            <div class="hint" id="ppStickyInfo" style="display:none;margin-bottom:8px">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg></span>
+              <div id="ppStickyText">—</div>
+            </div>
             <div class="hint" id="ppLastRefreshInfo" style="display:none">
               <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
               <div id="ppLastRefreshText">—</div>
             </div>
+            <div class="hint" id="ppTestProgress" style="display:none;margin-top:8px">
+              <span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="6" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></span>
+              <div id="ppTestProgressText">—</div>
+            </div>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>代理 URL</th><th>来源</th><th>添加时间</th><th>失败次数</th><th>最近使用</th><th style="text-align:right">操作</th></tr></thead>
+              <thead><tr><th>代理 URL</th><th>来源</th><th>检测状态</th><th>失败</th><th>操作</th></tr></thead>
               <tbody id="ppProxies">
-                <tr><td colspan="6"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">加载中...</div></div></td></tr>
+                <tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">加载中...</div></div></td></tr>
               </tbody>
             </table>
           </div>
@@ -4566,6 +4582,9 @@ function toast(msg,type='success'){
 // Global shared outbound proxy pool. Priority: per-account proxy > pool > direct.
 // See src/proxy/proxy-pool.ts for the backend implementation.
 let ppPoolState=null;
+// Test results cache: { [proxyId]: { ok, latencyMs, error?, status? } | 'testing' }
+let ppTestResults={};
+let ppTestAllRunning=false;
 
 async function loadProxyPool(){
   try{
@@ -4591,6 +4610,16 @@ function renderProxyPool(){
   const proxies=ppPoolState.proxies||[];
   document.getElementById('ppPoolCount').textContent=String(proxies.length);
 
+  // Sticky proxy indicator
+  const stickyInfo=document.getElementById('ppStickyInfo');
+  const stickyText=document.getElementById('ppStickyText');
+  if(ppPoolState.currentWorkingProxy){
+    stickyText.innerHTML=`<strong>当前使用代理：</strong><code class="code-inline">${escapeHtml(ppPoolState.currentWorkingProxy)}</code> — 后续请求将复用此代理，直到失败或 405 报错才轮询下一个`;
+    stickyInfo.style.display='flex';
+  }else{
+    stickyInfo.style.display='none';
+  }
+
   // Last refresh info
   const info=document.getElementById('ppLastRefreshInfo');
   const infoText=document.getElementById('ppLastRefreshText');
@@ -4609,22 +4638,35 @@ function renderProxyPool(){
 
   const tbody=document.getElementById('ppProxies');
   if(proxies.length===0){
-    tbody.innerHTML=`<tr><td colspan="6"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">代理池为空 — 在上方导入代理或配置来源 URL</div></div></td></tr>`;
+    tbody.innerHTML=`<tr><td colspan="5"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="empty-text">代理池为空 — 在上方导入代理或配置来源 URL</div></div></td></tr>`;
     return;
   }
   tbody.innerHTML=proxies.map(p=>{
-    const addedAt=p.addedAt?new Date(p.addedAt).toLocaleString():'-';
-    const lastUsed=p.lastUsedAt?new Date(p.lastUsedAt).toLocaleString():'-';
     const failures=p.failures||0;
     const sourceLabel=formatProxySource(p.source);
     const failBadge=failures>0?`<span class="badge badge-${failures>3?'danger':'warn'}">${failures}</span>`:'0';
+    const isSticky=ppPoolState.currentWorkingProxy===p.url;
+    const stickyMark=isSticky?'<span class="badge badge-info" title="当前正在使用">使用中</span> ':'';
+    // Test status: use cached result if available
+    const testResult=ppTestResults[p.id];
+    let testCell;
+    if(testResult==='testing'){
+      testCell='<span style="font-size:11px;color:var(--text-3)">检测中...</span>';
+    }else if(testResult&&testResult.ok){
+      testCell=`<span class="badge badge-success">${testResult.latencyMs}ms</span>`;
+    }else if(testResult&&!testResult.ok){
+      const errShort=(testResult.error||'失败').slice(0,30);
+      testCell=`<span class="badge badge-danger" title="${escapeHtml(testResult.error||'')}">${escapeHtml(errShort)}</span>`;
+    }else{
+      testCell='<span style="font-size:11px;color:var(--text-3)">未检测</span>';
+    }
     return `<tr>
-      <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all">${escapeHtml(p.url)}</td>
+      <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all">${stickyMark}${escapeHtml(p.url)}</td>
       <td>${escapeHtml(sourceLabel)}</td>
-      <td style="font-size:12px;color:var(--text-3)">${escapeHtml(addedAt)}</td>
+      <td style="text-align:center">${testCell}</td>
       <td style="text-align:center">${failBadge}</td>
-      <td style="font-size:12px;color:var(--text-3)">${escapeHtml(lastUsed)}</td>
-      <td style="text-align:right">
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="testOneProxy('${escapeHtml(p.id)}')" ${testResult==='testing'?'disabled':''}>检测</button>
         <button class="btn btn-ghost btn-sm" onclick="removeProxyPoolEntry('${escapeHtml(p.id)}')">删除</button>
       </td>
     </tr>`;
@@ -4765,11 +4807,85 @@ async function clearProxyPool(){
     if(!r.ok)throw new Error('HTTP '+r.status);
     const data=await r.json();
     toast(`已清空 ${data.removed} 条代理`);
+    ppTestResults={}; // clear test results
     await loadProxyPool();
   }catch(e){
     console.error('clearProxyPool failed:',e);
     toast('清空失败：'+e.message,'error');
   }
+}
+
+// Test a single proxy by id
+async function testOneProxy(id){
+  if(ppTestResults[id]==='testing')return; // already testing
+  ppTestResults[id]='testing';
+  renderProxyPool();
+  try{
+    const r=await fetch(API+'/admin/api/proxy-pool/test-one',{
+      method:'POST',headers:authHeaders(),
+      body:JSON.stringify({id}),
+    });
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    ppTestResults[id]=data;
+  }catch(e){
+    ppTestResults[id]={ok:false,error:e.message,latencyMs:0};
+  }
+  renderProxyPool();
+}
+
+// Test ALL proxies in batches of batchSize (concurrent within each batch)
+async function testAllProxies(){
+  if(ppTestAllRunning)return;
+  if(!ppPoolState||!ppPoolState.proxies||ppPoolState.proxies.length===0){
+    toast('代理池为空，无需检测','warn');
+    return;
+  }
+  const batchSize=Math.max(1,Math.min(50,parseInt(document.getElementById('ppBatchSize').value,10)||5));
+  const proxies=ppPoolState.proxies;
+  const total=proxies.length;
+  let tested=0,okCount=0,failCount=0;
+
+  ppTestAllRunning=true;
+  const btn=document.getElementById('ppTestAllBtn');
+  if(btn)btn.disabled=true;
+  const progress=document.getElementById('ppTestProgress');
+  const progressText=document.getElementById('ppTestProgressText');
+  progress.style.display='flex';
+
+  // Mark all as testing
+  for(const p of proxies)ppTestResults[p.id]='testing';
+  renderProxyPool();
+
+  // Process in batches
+  for(let i=0;i<total;i+=batchSize){
+    const batch=proxies.slice(i,i+batchSize);
+    const promises=batch.map(async p=>{
+      try{
+        const r=await fetch(API+'/admin/api/proxy-pool/test-one',{
+          method:'POST',headers:authHeaders(),
+          body:JSON.stringify({id:p.id}),
+        });
+        if(!r.ok)throw new Error('HTTP '+r.status);
+        const data=await r.json();
+        ppTestResults[p.id]=data;
+        if(data.ok)okCount++;else failCount++;
+      }catch(e){
+        ppTestResults[p.id]={ok:false,error:e.message,latencyMs:0};
+        failCount++;
+      }
+      tested++;
+      progressText.textContent=`检测中... ${tested}/${total}（成功 ${okCount}，失败 ${failCount}）`;
+      // Re-render after each batch completes (not per-proxy, to avoid flicker)
+    });
+    await Promise.all(promises);
+    renderProxyPool();
+  }
+
+  ppTestAllRunning=false;
+  if(btn)btn.disabled=false;
+  progress.style.display='none';
+  toast(`检测完成：共 ${total} 个，成功 ${okCount}，失败 ${failCount}`,okCount>0?'success':'warn');
 }
 </script>
 

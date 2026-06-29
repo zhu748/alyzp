@@ -180,3 +180,28 @@ test("Proxy pool endpoints require auth", async () => {
   // Without auth (and with proxyApiKey configured), should be 401.
   expect(resp.status).toBe(401);
 });
+
+test("POST /admin/api/proxy-pool/test-one returns 404 for unknown id", async () => {
+  const resp = await handler(new Request("http://x/admin/api/proxy-pool/test-one", {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({ id: "nonexistent" }),
+  }));
+  expect(resp.status).toBe(404);
+});
+
+test("POST /admin/api/proxy-pool/test-one requires id field", async () => {
+  const resp = await handler(new Request("http://x/admin/api/proxy-pool/test-one", {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({}),
+  }));
+  expect(resp.status).toBe(400);
+});
+
+test("GET /admin/api/proxy-pool returns currentWorkingProxy field", async () => {
+  const resp = await handler(new Request("http://x/admin/api/proxy-pool", { headers: authHeaders }));
+  expect(resp.status).toBe(200);
+  const data = await resp.json();
+  expect(data.currentWorkingProxy).toBeNull(); // no proxy picked yet
+});
