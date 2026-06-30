@@ -1,5 +1,50 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.2 — 修复 exe 模式下 Playwright solver 崩溃 (kind-of / stealth 插件 require 失败)**
+>
+> v0.0.0.1 的 Playwright solver 在源码模式 (`bun run src/index.ts`) 下能跑通,但编译成 Windows exe (`bun build --compile`) 后完全崩溃。本版本彻底重写 solver,确保 exe 模式也能正常 solve 验证码。
+>
+> **本次改动**
+>
+> - **根因: `playwright-extra` + `puppeteer-extra-plugin-stealth` 在 `bun build --compile` 下必崩**
+>   - `puppeteer-extra-plugin-stealth` 运行时 `require('kind-of')` 等 CJS 子模块,exe 模式没有 node_modules,报 `Cannot find package 'kind-of'`
+>   - `playwright-extra` 用 `require.resolve` 动态查找 playwright,同样失败,报 `Playwright is missing. :-)`
+>   - Fallback 到 JSDOM 后,JSDOM 在 exe 模式下也崩 (`idlUtils.implForWrapper(window2._document)._location` null)
+>   - 结果: exe 用户每次 solve 都走 JSDOM → F001 → 503 失败
+>
+> - **重写 `captcha-playwright.ts`: 纯 `playwright` + 构建期提取 stealth 补丁**
+>   - 去掉 `playwright-extra` + `puppeteer-extra-plugin-stealth` 运行时依赖
+>   - 新增 `scripts/generate-stealth-evasions.ts`: 构建期从 stealth 插件提取 14 个 evasion 的 JS 代码,打包成 `src/proxy/stealth-evasions.js.txt`(跟 `AliyunCaptcha.js.txt` 同样的 text import 模式)
+>   - 运行时用 `context.addInitScript(STEALTH_EVASIONS)` 注入,零 `require()` 调用,exe 模式完全兼容
+>   - 新增 CDP `Network.setUserAgentOverride`: 设置 `navigator.userAgentData`(Sec-CH-UA client hints),这是 `addInitScript` 无法 patch 的平台级属性
+>   - 新增手动 `navigator.platform` + `navigator.userAgentData` 补丁:确保 platform="Win32" 与 UA 一致(不匹配是强机器人信号)
+>
+> - **修复 3 个生成脚本 bug**:
+>   1. `eval(value as string)` — TypeScript 语法在浏览器里无效,改为 `eval(entry[1])`
+>   2. 每个 evasion 声明 `const _utilsFns` 在同一作用域冲突 — 给每个 evasion 包 IIFE `(function(){...})()`
+>   3. `chrome.runtime` evasion 默认跳过非 HTTPS 页面 — 设 `runOnInsecureOrigins: true`(about:blank 不是 HTTPS)
+>
+> - **修复 `captcha.ts` isLaunchFailure 判断逻辑**:
+>   - 旧版用正则匹配特定关键词 (`playwright|chromium|Executable`),漏了 `Cannot find package 'kind-of'`
+>   - 新版反转逻辑:只有 `SDK fail` (Aliyun 拒绝) 才重试 Playwright,其他错误一律切 JSDOM fallback
+>   - 效果:环境问题不再浪费一次 solve 周期 (~20s)
+>
+> - **`package.json` 依赖变更**:
+>   - 删除 `playwright-extra` + `puppeteer-extra-plugin-stealth`(运行时不需要)
+>   - 新增 `chromium-bidi` (playwright 的构建期依赖,`--external chromium-bidi` 排除出 bundle)
+>   - `build` 脚本加 `--external chromium-bidi --target=bun-windows-x64`(workflow 同步更新)
+>
+> - **`start.bat` / `start.sh` 新增选项 `i`**:
+>   - 一键安装/更新 Chromium binary (`bunx playwright install chromium` 或 `npx playwright install chromium`)
+>   - 首次使用 start-plan 模式前必须跑一次
+>   - 自动检测 bun / npx,都没有时给出安装链接
+>
+> - **实测结果**: 3 次连跑全过,平均 2.4 秒,verifyParam 280 字符。684 单测全过。Windows exe 编译成功 (PE32+, 107MB)。
+>
+> **升级建议**: 所有 v0.0.0.1 用户立即升级。v0.0.0.1 的 exe 包完全无法 solve 验证码。
+
+---
+
 > **v0.0.0.1 — Playwright 验证码 solver 根治阿里云风控 + 修复 ReadableStream is locked bug**
 >
 > 本次发版**彻底解决** start-plan 模式下验证码无法通过的问题。之前版本用 JSDOM 跑阿里云验证码 SDK,2024 年底阿里云风控升级后,JSDOM 环境被识别为机器人,每次 solve 都返回 `verifyCode F001`,导致所有 `/v1/messages` 请求 503 失败。

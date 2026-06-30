@@ -95,9 +95,19 @@ jobs:
         run: |
           # --target=bun-windows-x64 is mandatory: without it Bun emits a Linux
           # ELF that Windows rejects as "incompatible 16-bit application".
+          #
+          # v0.0.0.2+: --external chromium-bidi is mandatory. Playwright's
+          # coreBundle.js has a top-level `require("chromium-bidi/lib/cjs/...")`
+          # that bun-build can't resolve (chromium-bidi 16.x ships ESM-only,
+          # no /cjs/ subdir). The require is inside a lazy `__esm` init block
+          # that only runs if WebDriver BiDi protocol is used — we never use
+          # BiDi (only CDP), so excluding it from the bundle is safe.
+          # Without --external, bun build fails with:
+          #   error: Could not resolve: "chromium-bidi/lib/cjs/bidiMapper/BidiMapper"
           mkdir -p release
           bun build --compile \
             --define "require.resolve=undefined" \
+            --external chromium-bidi \
             --target=bun-windows-x64 \
             src/index.ts \
             --outfile release/zcode-proxy.exe

@@ -300,21 +300,45 @@ async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string):
           return result;
         } catch (err) {
           // Classify the Playwright failure.
-          //   - "SDK fail: ..." → Aliyun REJECTED the verification (F001).
-          //     This is NOT a Playwright launch failure — the browser
-          //     worked, the SDK ran, Aliyun just said no. Retrying MAY
-          //     help (different fingerprint from new context). Don't
-          //     disable Playwright for this — just retry.
-          //   - "Target page, context or browser has been closed" /
-          //     "Browser has been closed" / "Executable doesn't exist" /
-          //     "Failed to launch" → Playwright is BROKEN in this
-          //     environment. Disable it for the rest of this call and
-          //     fall back to JSDOM (if allowed).
+          //
+          // Two categories:
+          //   (A) "SDK fail: ..." → Aliyun REJECTED the verification (F001).
+          //       The browser worked, the SDK ran, Aliyun just said no.
+          //       Retrying MAY help (different fingerprint from new context).
+          //       Don't disable Playwright for this — just retry.
+          //
+          //   (B) ANY OTHER ERROR → Playwright is BROKEN in this environment.
+          //       This covers:
+          //         - "Cannot find package 'kind-of'" (transitive dep missing
+          //            under bun build --compile)
+          //         - "Playwright is missing. :-)" (playwright-extra runtime
+          //            require.resolve failed under --compile)
+          //         - "Executable doesn't exist" (chromium binary not installed)
+          //         - "Failed to launch" (chromium system deps missing)
+          //         - "Browser has been closed" / "Target page...closed"
+          //         - "captcha (playwright) hard-guard timeout"
+          //         - "captcha solve timeout" (when SDK never loads —
+          //            environment issue, not Aliyun rejection)
+          //
+          // v0.0.0.2 BUGFIX: previously the isLaunchFailure regex only
+          // matched specific keywords (playwright, chromium, Executable,
+          // etc). This missed "Cannot find package 'kind-of'" — kind-of
+          // is a transitive dep of puppeteer-extra-plugin-stealth, and
+          // its absence is a clear sign the exe is missing modules.
+          // The result: attempt 1 threw "kind-of" error, was NOT
+          // classified as launch failure, did NOT fall back to JSDOM,
+          // and was surfaced as a regular retry. Then attempt 2 re-tried
+          // Playwright (got "Playwright is missing" — which DID match
+          // the regex) and only THEN fell back. Wasted one full solve
+          // cycle (~20s) per request.
+          //
+          // Fix: invert the logic. ONLY "SDK fail" errors are treated
+          // as retry-able (Aliyun said no). Everything else is treated
+          // as a Playwright environment failure → disable + fall back.
           const msg = (err as Error).message ?? "";
-          const isLaunchFailure = /Executable doesn't exist|Failed to launch|browser has been closed|Browser has been closed|Target page, context or browser has been closed|playwright|chromium/i.test(msg)
-            && !/SDK fail/i.test(msg);
-          if (isLaunchFailure) {
-            console.warn(`${tag}[captcha] Playwright unavailable (${msg.substring(0, 120)}...), ${USE_JSDOM_FALLBACK ? "falling back to JSDOM" : "no fallback configured"} (attempt ${attempt}/${SOLVE_RETRIES})`);
+          const isSdkFailure = /SDK fail/i.test(msg);
+          if (!isSdkFailure) {
+            console.warn(`${tag}[captcha] Playwright unavailable (${msg.substring(0, 120)}${msg.length > 120 ? "..." : ""}), ${USE_JSDOM_FALLBACK ? "falling back to JSDOM" : "no fallback configured"} (attempt ${attempt}/${SOLVE_RETRIES})`);
             playwrightDisabled = true;
             if (!USE_JSDOM_FALLBACK) {
               // No fallback — surface as a regular retry-able error.
@@ -322,8 +346,8 @@ async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string):
             }
             // Fall through to JSDOM path below.
           } else {
-            // SDK-level failure (e.g. F001) or solve timeout — these are
-            // retry-able, NOT a Playwright environment issue.
+            // SDK-level failure (F001) — retry-able, NOT a Playwright
+            // environment issue. Don't disable Playwright.
             throw err;
           }
         }

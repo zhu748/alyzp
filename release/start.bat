@@ -16,6 +16,7 @@ echo   9. Import key from ZCode (Z.AI) - Start Plan
 echo   a. Check login status
 echo   b. Logout
 echo   c. Export credential for Render/cloud deploy
+echo   i. Install/Update Chromium (for start-plan captcha)
 echo   0. Exit
 echo.
 set /p choice=Select:
@@ -32,12 +33,17 @@ if "%choice%"=="9" goto import_zai_sp
 if "%choice%"=="a" goto status
 if "%choice%"=="b" goto logout
 if "%choice%"=="c" goto export
+if "%choice%"=="i" goto install_chromium
 if "%choice%"=="0" exit
 goto end
 
 :serve
 echo.
 echo Starting proxy server...
+echo.
+echo (If start-plan captcha fails with "Executable doesn't exist",
+echo  run option i first to install Chromium.)
+echo.
 zcode-proxy.exe serve config.yaml
 pause
 goto end
@@ -116,6 +122,45 @@ echo Exporting credential as base64 for ZCODE_OAUTH_CREDENTIAL env var...
 echo (Used for Render / Fly.io / K8s deployment in oauth mode)
 echo.
 zcode-proxy.exe auth export
+pause
+goto end
+
+:install_chromium
+echo.
+echo ============================================
+echo  Installing Chromium for Playwright captcha
+echo ============================================
+echo.
+echo This downloads ~150MB Chromium binary to:
+echo   %USERPROFILE%\AppData\Local\ms-playwright\
+echo.
+echo Required only for start-plan mode. Coding-plan users can skip.
+echo.
+echo Checking for bun...
+where bun >nul 2>&1
+if %ERRORLEVEL%==0 (
+  echo Found bun, using it to install Chromium...
+  bunx playwright install chromium
+  goto chromium_done
+)
+echo Checking for npx...
+where npx >nul 2>&1
+if %ERRORLEVEL%==0 (
+  echo Found npx, using it to install Chromium...
+  npx playwright install chromium
+  goto chromium_done
+)
+echo.
+echo ERROR: Neither bun nor npx found in PATH.
+echo Install Bun from https://bun.sh/ or Node.js from https://nodejs.org/
+echo Then re-run this option.
+echo.
+pause
+goto end
+:chromium_done
+echo.
+echo Chromium installed successfully.
+echo.
 pause
 goto end
 
