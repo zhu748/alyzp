@@ -1635,12 +1635,22 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
     expect(toolResultBlock.cache_control).toBeUndefined();
   });
 
-  it("appends a near-empty text block carrying cc when last user msg has only tool_result (mirrors real ZCode)", () => {
-    // Real ZCode desktop client sample (msg[122]): cc sits on a text block
-    // with text_len=1 at the tail of the last user message. When Claude Code's
-    // last user message is purely tool_result blocks (tool-call continuation),
-    // the proxy appends a single-space text block carrying cc to mirror that
-    // wire shape — without disturbing the existing tool_result blocks.
+  it("SKIPS cache_control when last user msg has tool_result (v0.2.1.3+ fix for gateway 1213)", () => {
+    // v0.2.0.9–v0.2.1.2 regression: when Claude Code's last user message was
+    // a tool-call continuation (only tool_result blocks, no text), the proxy
+    // appended a single-space text block carrying cc to mirror what the
+    // developer thought was the real ZCode cc-anchor pattern.
+    //
+    // This was a MISREADING of the zcode reference sample: msg[122]'s cc
+    // anchor is on a user message with ONLY text blocks, NOT on a user
+    // message that also contains tool_result. The zcode gateway rejects
+    // the appended-text+cc-on-tool-result-user-msg pattern with
+    // `[1213][未正常接收到prompt参数。]`.
+    //
+    // v0.2.1.3+ fix: when the last user message contains ANY tool_result
+    // block, SKIP cache_control injection entirely. Better to miss the cache
+    // optimization than to fail the request. The next turn (when the user
+    // sends a text-only message) picks up cc normally.
     const body = JSON.stringify({
       model: "glm-5.2",
       max_tokens: 1000,
@@ -1665,18 +1675,58 @@ describe("transformRequestBody — cache_control fingerprint alignment (v0.2.1+)
     const lastUser = parsed.messages[parsed.messages.length - 1];
     expect(lastUser.role).toBe("user");
 
-    // The tool_result block must remain unchanged.
+    // The tool_result block must remain unchanged (no cc on it — Claude
+    // Code's original cc was already stripped by sanitizeContentBlocks).
     const toolResultBlock = lastUser.content.find((b: any) => b.type === "tool_result");
     expect(toolResultBlock).toBeDefined();
     expect(toolResultBlock.cache_control).toBeUndefined();
 
-    // A new text block must have been APPENDED at the tail, carrying cc, with
-    // a near-empty (single-space) text payload — mirrors real ZCode's
-    // msg[122].content[3] (text_len=1, cc=ephemeral).
-    const lastBlock = lastUser.content[lastUser.content.length - 1];
-    expect(lastBlock.type).toBe("text");
-    expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
-    expect(lastBlock.text.length).toBe(1);
+    // NO new text block should have been appended. The user message's
+    // content array length must be unchanged (still just 1 tool_result).
+    expect(lastUser.content.length).toBe(1);
+
+    // NO block anywhere in the last user message should carry cache_control.
+    for (const block of lastUser.content) {
+      expect(block.cache_control).toBeUndefined();
+    }
+  });
+
+  it("SKIPS cache_control when last user msg has tool_result + text (v0.2.1.3+ fix)", () => {
+    // Even when the last user message has a text block alongside tool_result,
+    // we still skip cc — the zcode reference NEVER attaches cc to a user
+    // message that also contains tool_result, regardless of where the text
+    // block sits. Attaching cc to the text block in such a message also
+    // triggers the gateway 1213 error.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [
+        { role: "user", content: "first question" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_1", name: "Bash", input: { cmd: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [
+            { tool_use_id: "call_1", type: "tool_result", content: "file1.js" },
+            { type: "text", text: "what next?" },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    const lastUser = parsed.messages[parsed.messages.length - 1];
+    expect(lastUser.role).toBe("user");
+    expect(lastUser.content.length).toBe(2); // unchanged: tool_result + text
+
+    // NO block in this user message should carry cc — skipping entirely.
+    for (const block of lastUser.content) {
+      expect(block.cache_control).toBeUndefined();
+    }
   });
 
   it("NEVER attaches cache_control to assistant messages (no fallthrough)", () => {

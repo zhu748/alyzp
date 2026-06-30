@@ -1,5 +1,20 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.3 — 修复 Claude Code 多轮工具调用时 [1213] 网关错误**
+>
+> 修复 v0.2.0.9 引入的 cache_control 指纹对齐回归 bug。当 Claude Code 进行多轮工具调用时（最后一轮 user 消息是 tool-call 续传，只含 `tool_result` blocks），代理会追加一个 `text:" "` + cc 块到该消息尾部，触发 zcode 网关 `[1213][未正常接收到prompt参数。]` 错误。
+>
+> **本次改动**
+>
+> - **根因**：v0.2.0.9 commit `51f2ce7` 误读了 zcode 参考样本。`msg[122].content[3]` 的 cc 锚点确实在 `text_len=1` 的块上，但那条消息只有 4 个 text block，没有 `tool_result`。开发者漏看了这个前提，于是在 Claude Code 的 tool-call 续传消息尾部追加 text+cc —— 这种结构 zcode 网关不接受。
+> - **修复**：`applyAnthropicCacheControl` 改为——当最后一条 user 消息含任何 `tool_result` block 时，完全跳过 cc 注入，不再追加 text block。代价是这一轮丢掉 prompt cache 优化，但请求能成功；下一轮用户发文本消息时 cc 自然恢复。
+> - **测试**：原断言 "追加 text block" 的测试改为断言 "跳过 cc"，并新增 "tool_result + text 共存时也跳过" 的测试用例。645 个单元测试全部通过，TypeScript 类型检查零错误。
+> - **影响范围**：仅影响 `start-plan` 与 `coding-plan` 模式下 Claude Code 客户端的多轮工具调用场景。其他客户端（Codex / Cherry Studio）如果不在最后一条 user 消息里塞 tool_result 则不受影响。
+>
+> **升级建议**：所有在 v0.2.0.9 ~ v0.2.1.2 之间遇到 `[1213]` 或 "Claude Code 用着用着突然报错" 的用户立即升级到 v0.2.1.3。
+
+---
+
 > **v0.2.1.2 — 全面优化：并发竞态修复 + 性能提升 + 死代码清理**
 >
 > 本版本对核心代理转发链路进行了两轮深度优化，修复了多个并发竞态与资源泄漏，显著降低了 WAF 重试与凭证切换路径的事件循环阻塞，并清理了 255 行无生产引用的 deprecated 死代码。所有 644 个单元测试通过，TypeScript 类型检查零错误。
