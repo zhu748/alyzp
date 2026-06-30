@@ -43,6 +43,7 @@
 import { chromium } from "playwright";
 import { existsSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import STEALTH_EVASIONS from "./stealth-evasions.js.txt" with { type: "text" };
 
@@ -101,7 +102,7 @@ function ensureChromiumPath(): void {
 
 // === Singleton browser management ===
 
-let browserPromise: Promise<import("playwright").Browser> | null = null;
+let browserPromise: Promise<import("playwright").BrowserContext> | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
@@ -145,7 +146,7 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null;
  * the cached promise (so concurrent first-solves don't race to spawn
  * multiple browsers — they all await the same one).
  */
-async function acquireBrowser(): Promise<import("playwright").Browser> {
+async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
   if (!browserPromise) {
     browserPromise = (async () => {
       // v0.0.0.3: Ensure Playwright can find the bundled Chromium.
@@ -189,11 +190,29 @@ async function acquireBrowser(): Promise<import("playwright").Browser> {
 
       console.log("[captcha] Launching Chromium...");
       const launchStart = Date.now();
-      const browser = await chromium.launch({
+      // v0.0.0.6: Use launchPersistentContext instead of launch.
+      // Playwright forbids --user-data-dir in launch() args; must use
+      // launchPersistentContext(userDataDir, options). This also gives
+      // us a fresh temp profile dir per launch (avoids permission issues
+      // and locks from other Chrome instances on Windows).
+      const userDataDir = process.env.PLAYWRIGHT_BROWSERS_PATH
+        ? join(process.env.PLAYWRIGHT_BROWSERS_PATH, "..", "pw-profile")
+        : join(tmpdir(), "zcode-pw-profile");
+      const browser = await chromium.launchPersistentContext(userDataDir, {
         headless: true,
-        // v0.0.0.5: Direct executablePath instead of channel="chromium".
-        // channel="chromium" caused 70s timeout in Windows exe mode
-        // (Playwright's channel resolution hung). Direct path is reliable.
+        // v0.0.0.6: Explicit timeout — if launch hangs (Chrome for Testing
+        // on Windows Server can hang on first-run checks / Google Update
+        // service / default browser check), fail fast at 30s instead of
+        // waiting 70s for the hard-guard.
+        timeout: 30_000,
+        // Context-level options (launchPersistentContext returns a context,
+        // so UA / locale / viewport go here, not in newContext()).
+        userAgent: FAKE_UA,
+        locale: "en-US",
+        viewport: { width: 1280, height: 720 },
+        extraHTTPHeaders: {
+          "accept-language": "en-US,en;q=0.9",
+        },
         ...(executablePath ? { executablePath } : {}),
         args: [
           "--no-sandbox",
@@ -202,9 +221,83 @@ async function acquireBrowser(): Promise<import("playwright").Browser> {
           "--disable-blink-features=AutomationControlled",
           "--disable-extensions",
           "--disable-gpu",
+          // v0.0.0.6: Skip Windows first-run / default-browser checks.
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-background-networking",
+          "--disable-sync",
+          "--disable-translate",
+          "--disable-background-timer-throttling",
+          "--disable-renderer-backgrounding",
+          "--disable-device-discovery-notifications",
+          "--disable-default-apps",
+          "--disable-component-extensions-with-background-pages",
+          "--disable-features=TranslateUI",
         ],
       });
       console.log(`[captcha] Chromium launched in ${Date.now() - launchStart}ms`);
+
+      // v0.0.0.6: Inject stealth init scripts ONCE at context creation
+      // (not per-solve). addInitScript registers a script that runs on
+      // every navigation / setContent, before the page's own scripts.
+      await browser.addInitScript(STEALTH_EVASIONS);
+      await browser.addInitScript(`
+        // Patch navigator.platform to match the Windows UA.
+        try {
+          Object.defineProperty(navigator, 'platform', {
+            get: () => 'Win32',
+            configurable: true,
+          });
+        } catch (e) {}
+        // Patch navigator.userAgentData if the CDP call didn't set it.
+        try {
+          if (!navigator.userAgentData) {
+            Object.defineProperty(navigator, 'userAgentData', {
+              get: () => ({
+                brands: [
+                  { brand: ' Not A(Brand', version: '99' },
+                  { brand: 'Chromium', version: '131' },
+                  { brand: 'Google Chrome', version: '131' },
+                ],
+                mobile: false,
+                platform: 'Windows',
+                getHighEntropyValues: (hints) => Promise.resolve({
+                  architecture: 'x86',
+                  bitness: '64',
+                  brands: [
+                    { brand: ' Not A(Brand', version: '99.0.0.0' },
+                    { brand: 'Chromium', version: '131.0.0.0' },
+                    { brand: 'Google Chrome', version: '131.0.0.0' },
+                  ],
+                  fullVersionList: [
+                    { brand: ' Not A(Brand', version: '99.0.0.0' },
+                    { brand: 'Chromium', version: '131.0.0.0' },
+                    { brand: 'Google Chrome', version: '131.0.0.0' },
+                  ],
+                  fullVersion: '131.0.0.0',
+                  mobile: false,
+                  model: '',
+                  platform: 'Windows',
+                  platformVersion: '10.0.0',
+                  uaFullVersion: '131.0.0.0',
+                  wow64: false,
+                }),
+                toJSON: () => ({
+                  brands: [
+                    { brand: ' Not A(Brand', version: '99' },
+                    { brand: 'Chromium', version: '131' },
+                    { brand: 'Google Chrome', version: '131' },
+                  ],
+                  mobile: false,
+                  platform: 'Windows',
+                }),
+              }),
+              configurable: true,
+            });
+          }
+        } catch (e) {}
+      `);
+
       return browser;
     })().catch((err) => {
       browserPromise = null;
@@ -268,186 +361,26 @@ export async function solveInPlaywright(cfg: FetchedCaptchaConfig, _reqId?: stri
 }
 
 async function solveInPlaywrightInner(cfg: FetchedCaptchaConfig): Promise<string> {
-  const browser = await acquireBrowser();
-  // Fresh context per solve — isolation of cookies, storage, and the
-  // stealth plugin's randomized fingerprint (WebGL vendor, etc).
-  const context = await browser.newContext({
-    userAgent: FAKE_UA,
-    locale: "en-US",
-    viewport: { width: 1280, height: 720 },
-    // Hide the "headless" hint from navigator. STEALTH_EVASIONS
-    // also patches this, but explicit is better.
-    extraHTTPHeaders: {
-      "accept-language": "en-US,en;q=0.9",
-    },
-  });
-
-  // Inject stealth patches BEFORE any page script runs. addInitScript
-  // registers a script that runs on every navigation / setContent,
-  // before the page's own scripts. This is critical — without it,
-  // Aliyun's SDK would see navigator.webdriver=true on first access.
-  //
-  // v0.0.0.2: STEALTH_EVASIONS is auto-generated at build time by
-  // scripts/generate-stealth-evasions.ts from puppeteer-extra-plugin-stealth.
-  // It contains all 14 page-level evasions (chrome.app, chrome.csi,
-  // chrome.loadTimes, chrome.runtime, iframe.contentWindow, media.codecs,
-  // navigator.hardwareConcurrency, navigator.languages, navigator.permissions,
-  // navigator.plugins, navigator.vendor, navigator.webdriver, webgl.vendor,
-  // window.outerdimensions). The 15th evasion (user-agent-override) is
-  // CDP-level and handled by Playwright's newContext({ userAgent }).
-  //
-  // Bundling evasions as a text file avoids all runtime require() calls —
-  // critical for bun build --compile which has no node_modules at runtime.
-  // Inject stealth patches BEFORE any page script runs.
-  //
-  // v0.0.0.2: STEALTH_EVASIONS is auto-generated at build time by
-  // scripts/generate-stealth-evasions.ts from puppeteer-extra-plugin-stealth.
-  //
-  // BUT: addInitScript alone can't set navigator.userAgentData (Sec-CH-UA
-  // client hints) — that requires CDP Network.setUserAgentOverride. So we
-  // ALSO use a CDP session to set the full UA metadata. This is what
-  // playwright-extra's stealth plugin does under the hood.
-  // v0.0.0.2: STEALTH_EVASIONS covers 14 page-level evasions from
-  // puppeteer-extra-plugin-stealth. But it CAN'T patch navigator.platform
-  // (the stealth plugin's user-agent-override evasion does this via CDP +
-  // JS, but we couldn't generate it because it needs page._client()).
-  //
-  // This supplemental init script patches navigator.platform and
-  // navigator.userAgentData to match our Windows Chrome 131 UA. Without
-  // this, navigator.platform returns "Linux x86_64" (host OS) while the
-  // UA string says Windows — a strong bot signal.
-  await context.addInitScript(STEALTH_EVASIONS);
-  await context.addInitScript(`
-    // Patch navigator.platform to match the Windows UA.
-    try {
-      Object.defineProperty(navigator, 'platform', {
-        get: () => 'Win32',
-        configurable: true,
-      });
-    } catch (e) {}
-    // Patch navigator.userAgentData if the CDP call didn't set it
-    // (happens on some Chromium versions / headless mode).
-    try {
-      if (!navigator.userAgentData) {
-        Object.defineProperty(navigator, 'userAgentData', {
-          get: () => ({
-            brands: [
-              { brand: ' Not A(Brand', version: '99' },
-              { brand: 'Chromium', version: '131' },
-              { brand: 'Google Chrome', version: '131' },
-            ],
-            mobile: false,
-            platform: 'Windows',
-            getHighEntropyValues: (hints) => Promise.resolve({
-              architecture: 'x86',
-              bitness: '64',
-              brands: [
-                { brand: ' Not A(Brand', version: '99.0.0.0' },
-                { brand: 'Chromium', version: '131.0.0.0' },
-                { brand: 'Google Chrome', version: '131.0.0.0' },
-              ],
-              fullVersionList: [
-                { brand: ' Not A(Brand', version: '99.0.0.0' },
-                { brand: 'Chromium', version: '131.0.0.0' },
-                { brand: 'Google Chrome', version: '131.0.0.0' },
-              ],
-              fullVersion: '131.0.0.0',
-              mobile: false,
-              model: '',
-              platform: 'Windows',
-              platformVersion: '10.0.0',
-              uaFullVersion: '131.0.0.0',
-              wow64: false,
-            }),
-            toJSON: () => ({
-              brands: [
-                { brand: ' Not A(Brand', version: '99' },
-                { brand: 'Chromium', version: '131' },
-                { brand: 'Google Chrome', version: '131' },
-              ],
-              mobile: false,
-              platform: 'Windows',
-            }),
-          }),
-          configurable: true,
-        });
-      }
-    } catch (e) {}
-  `);
-
+  // v0.0.0.6: acquireBrowser() returns a BrowserContext with stealth
+  // init scripts already injected. We just create a new page.
+  const context = await acquireBrowser();
   const page = await context.newPage();
 
-  // v0.0.0.2 CRITICAL: Set navigator.userAgentData via CDP.
-  //
-  // The stealth plugin's user-agent-override evasion normally handles this
-  // via `Network.setUserAgentOverride` with `userAgentMetadata`. Under
-  // bun build --compile we can't use playwright-extra, so we replicate the
-  // CDP call directly.
-  //
-  // Without this, navigator.userAgentData.brands returns empty and
-  // navigator.platform returns "Linux x86_64" (host OS) instead of "Win32"
-  // (matching the Windows UA). Aliyun's risk control checks for this
-  // UA/platform consistency.
   try {
-    const client = await context.newCDPSession(page);
-    await client.send("Network.setUserAgentOverride", {
-      userAgent: FAKE_UA,
-      acceptLanguage: "en-US,en",
-      userAgentMetadata: {
-        brands: [
-          { brand: " Not A(Brand", version: "99" },
-          { brand: "Chromium", version: "131" },
-          { brand: "Google Chrome", version: "131" },
-        ],
-        fullVersionList: [
-          { brand: " Not A(Brand", version: "99.0.0.0" },
-          { brand: "Chromium", version: "131.0.0.0" },
-          { brand: "Google Chrome", version: "131.0.0.0" },
-        ],
-        fullVersion: "131.0.0.0",
-        platform: "Windows",
-        platformVersion: "10.0.0",
-        architecture: "x86",
-        bitness: "64",
-        model: "",
-        mobile: false,
-        wow64: false,
-      },
-    });
-  } catch (err) {
-    // Non-fatal: if CDP fails, the init-script patches still cover most
-    // checks. Aliyun MAY still detect via userAgentData, but better than
-    // nothing.
-    console.warn(`[captcha] CDP UA override failed: ${(err as Error).message}`);
-  }
-
-  try {
-    // Inject the SDK HTML with stealth evasions in <head> BEFORE the SDK.
-    //
-    // v0.0.0.2 CRITICAL: cannot use template literals here because the
-    // stealth evasions code contains `${...}` patterns (from puppeteer-
-    // extra-plugin-stealth's utils functions). Template literals would
-    // interpret those as interpolation and mangle the code. Must use
-    // string concatenation.
-    //
-    // Also must escape </script> in both the stealth code and the SDK
-    // code to prevent premature </script> termination of the inline
-    // script tag.
-    const stealthSafe = STEALTH_EVASIONS.replace(/<\/script>/gi, "<\\/script>");
+    // v0.0.0.6: Stealth is already injected via addInitScript at context
+    // creation time, so the HTML only needs the Aliyun SDK. (Previously
+    // we embedded STEALTH_EVASIONS in the HTML <head> too — redundant.)
     const sdkSafe = ALIYUN_SDK_LOCAL.replace(/<\/script>/gi, "<\\/script>");
     const html =
-      "<!DOCTYPE html><html><head><script>" + stealthSafe + "</script></head>" +
+      "<!DOCTYPE html><html><head></head>" +
       "<body><div id=\"captcha-element\"></div><button id=\"captcha-button\"></button>" +
       "<script>" + sdkSafe + "</script></body></html>";
 
-    // v0.0.0.5: diagnostic logs at each step to identify where it hangs
     console.log("[captcha] setContent...");
     const t1 = Date.now();
     await page.setContent(html, { waitUntil: "domcontentloaded" });
     console.log(`[captcha] setContent done in ${Date.now() - t1}ms`);
 
-    // Wait for the SDK to expose initAliyunCaptcha. Real Chromium runs
-    // the SDK much faster than JSDOM (no vm boundary), usually <500ms.
     console.log("[captcha] waiting for SDK to load...");
     const t2 = Date.now();
     await page.waitForFunction(

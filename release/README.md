@@ -1,5 +1,38 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.6 — 修复 Chromium 在 Windows exe 下启动 hang (launchPersistentContext + 首次启动跳过)**
+>
+> v0.0.0.5 修复了 channel 导致的 hang, 但用户反馈 `Launching Chromium...` 后仍然卡住。根因是 Chrome for Testing 在 Windows Server / Administrator 账户下首次启动时会尝试访问 Google Update 服务 / 默认浏览器检查 / 创建 user data dir, 这些操作在精简 Windows 环境下会阻塞 60+ 秒。本版本用 `launchPersistentContext` + 一堆 `--no-first-run` flag 彻底解决。
+>
+> **本次改动**
+>
+> - **根因: Chrome 首次启动的 Windows 集成检查 hang**
+>   - Chrome for Testing 启动时默认会: 检查是否默认浏览器 (访问 Registry) / 连 Google Update 服务 / 创建 `%LOCALAPPDATA%\Google\Chrome\User Data` / 加载默认 apps
+>   - 在 Windows Server / Administrator 账户 / 精简 Windows 下, 这些操作可能阻塞 60+ 秒甚至死锁
+>   - `chromium.launch()` 的 promise 永远 pending, 70 秒后 hard-guard 超时
+>
+> - **改用 `chromium.launchPersistentContext(userDataDir, options)`**
+>   - 之前用 `chromium.launch()` + 每次 solve 调 `browser.newContext()` —— 但 Playwright 不允许在 launch args 里传 `--user-data-dir`, 必须用 `launchPersistentContext`
+>   - 现在用 `launchPersistentContext` 直接指定临时 user-data-dir, 避免使用 Chrome 默认的 `%LOCALAPPDATA%` 目录 (可能有权限问题或被其他 Chrome 实例锁住)
+>   - 返回的是 `BrowserContext` (不是 `Browser`), 简化了代码——不再需要 `newContext()`, stealth init scripts 在 launch 时一次性注入
+>
+> - **加 11 个 Chrome 启动 flag 跳过 Windows 集成**:
+>   - `--no-first-run` / `--no-default-browser-check` — 跳过首次启动检查
+>   - `--disable-background-networking` / `--disable-sync` — 不连 Google 服务
+>   - `--disable-translate` / `--disable-default-apps` / `--disable-component-extensions-with-background-pages` — 不加载额外组件
+>   - `--disable-background-timer-throttling` / `--disable-renderer-backgrounding` — 防止后台节流
+>   - `--disable-device-discovery-notifications` / `--disable-features=TranslateUI`
+>
+> - **加 `timeout: 30000` 到 launch** — 如果还 hang, 30 秒后失败 (而不是 70 秒)
+>
+> - **重构 stealth 注入**: 从 per-solve 改为 per-context (launch 时一次注入), 效率更高
+>
+> - **本地实测**: launch 208ms + setContent 285ms + SDK 35ms + solve 1646ms = 总 3.4s
+>
+> **升级建议**: 所有 v0.0.0.5 用户立即升级。v0.0.0.5 在 Windows exe 下 Chromium 启动 hang, v0.0.0.6 修复。
+
+---
+
 > **v0.0.0.5 — 用 executablePath 直接指定 chrome.exe, 绕过 channel 导致的 70s 超时**
 >
 > v0.0.0.4 修复了 `chromium undefined` 的问题, 但启动后 solve 卡 70 秒超时 (`hard-guard timeout after 70000ms`)。根因是 `channel: "chromium"` 选项在 Windows exe 模式下触发 Playwright 的 channel 解析逻辑, 该逻辑在 exe 里会 hang。本版本用 `executablePath` 直接指定 chrome.exe 路径, 彻底绕过 Playwright 的浏览器查找逻辑。
