@@ -56,6 +56,16 @@ jobs:
       - name: Install deps
         run: bun install --frozen-lockfile
 
+      - name: Patch playwright-core for bun build --compile
+        run: bun run scripts/patch-playwright.ts
+        # v0.0.0.4: playwright-core's coreBundle.js uses __dirname to find
+        # its own package.json at module load time. bun build --compile
+        # hardcodes __dirname to the BUILD machine's path (Linux), so the
+        # Windows exe can't find it → chromium is undefined → captcha fails.
+        # This patch replaces the require() with a hardcoded version string.
+        # postinstall already does this, but we run it again here for safety
+        # (in case bun install --frozen-lockfile skipped postinstall).
+
       - name: Type check (tsc --noEmit)
         run: bun x tsc --noEmit
 

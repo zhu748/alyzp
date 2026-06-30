@@ -1,13 +1,13 @@
 {
   "name": "zcode-proxy",
-  "version": "0.0.0.3",
+  "version": "0.0.0.4",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
     "test": "bun test",
     "build": "bun build --compile --define \"require.resolve=undefined\" --external chromium-bidi --target=bun-windows-x64 src/index.ts --outfile zcode-proxy.exe",
-    "postinstall": "playwright install chromium"
+    "postinstall": "bun run scripts/patch-playwright.ts && playwright install chromium"
   },
   "dependencies": {
     "chromium-bidi": "^16.0.1",

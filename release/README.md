@@ -1,5 +1,30 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.4 — 修复 playwright-core __dirname 在 exe 模式下路径硬编码导致 chromium undefined**
+>
+> v0.0.0.3 的 zip 解压后启动, Chromium 路径能找到了, 但 `chromium.launch()` 仍然失败, 报 `Cannot find module '\home\runner\work\alyzp\alyzp\node_modules\playwright-core\package.json'`。本版本通过编译时 patch 彻底解决。
+>
+> **本次改动**
+>
+> - **根因: `playwright-core` 的 `coreBundle.js` 在模块加载时用 `__dirname` 找自己的 `package.json`**
+>   - 代码: `packageRoot = path.join(__dirname, ".."); packageJSON = require(path.join(packageRoot, "package.json"));`
+>   - `bun build --compile` 把 `__dirname` 在**编译时**解析成构建机器的绝对路径 (GitHub Actions runner 的 `/home/runner/work/alyzp/alyzp/node_modules/playwright-core/lib/`)
+>   - Windows exe 运行时这个 Linux 路径不存在 → `require()` 抛异常 → 整个 `__esm` 初始化块失败 → `chromium` 导出为 `undefined` → `chromium.launch()` 报 `undefined is not an object`
+>   - `--define "require.resolve=undefined"` 不生效, 因为这里是 `require(path)` 不是 `require.resolve`
+>
+> - **新增 `scripts/patch-playwright.ts`: 编译时 patch coreBundle.js**
+>   - `packageRoot = path.join(__dirname, "..")` → `packageRoot = "."` (binPath 只用于 CLI, 我们不用)
+>   - `packageJSON = require(...)` → `packageJSON = { version: "1.61.1" }` (packageJSON 只用来读 version)
+>   - 幂等: 检测到已 patch 就跳过, 安全多次运行
+>   - `postinstall` 自动执行 (`bun install` 后自动 patch node_modules)
+>   - GitHub Actions workflow 在 `Install deps` 后也显式跑一次 (防止 `--frozen-lockfile` 跳过 postinstall)
+>
+> - **实测结果**: 本地 patch 后 `test-captcha` 3.8 秒成功, verifyParam 280 字符。Windows exe 编译成功 (PE32+, 107MB)。
+>
+> **升级建议**: 所有 v0.0.0.3 用户立即升级。v0.0.0.3 的 exe 启动后 captcha 必崩 (chromium undefined), v0.0.0.4 修复。
+
+---
+
 > **v0.0.0.3 — Chromium 内置到 zip, 解压即用, 零配置**
 >
 > v0.0.0.2 修复了 exe 模式下 Playwright solver 崩溃的问题, 但用户还需要手动跑 `start.bat` 选项 `i` 安装 ~150MB Chromium binary。本版本直接把 Chromium 打包进 zip, 用户解压后双击 `start.bat` 选 `1` 就能立即启动, 完全零配置。
