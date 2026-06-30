@@ -66,6 +66,41 @@ import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import { createMutex } from "../utils/fs.js";
 import type { AsyncMutex } from "../utils/fs.js";
 
+// v0.2.1.8+: Playwright-based solver is the production path. JSDOM is kept
+// as a fallback (controlled by ZCODE_CAPTCHA_SOLVER env var) for
+// environments where Playwright can't run (no Chromium binary, no system
+// deps, OOM-prone Free tier, etc).
+//
+// Why Playwright is the default:
+//   - Aliyun's risk control has evolved to detect JSDOM environments
+//     with near-100% accuracy (every solve returns verifyCode F001).
+//     The detection vectors (no real layout engine, no real WebGL,
+//     vm-boundary stack frames) cannot be patched via polyfills.
+//   - Playwright drives a REAL Chromium binary via CDP; combined with
+//     the stealth plugin, it passes traceless verification on first
+//     attempt. Verified against live zcode.z.ai captcha config.
+//
+// Solver selection precedence:
+//   1. ZCODE_CAPTCHA_SOLVER=jsdom  → force JSDOM (debug / old envs)
+//   2. ZCODE_CAPTCHA_SOLVER=playwright → force Playwright
+//   3. unset / auto → Playwright first, fall back to JSDOM on launch
+//      failure (auto mode — sensible default for mixed environments).
+const CAPTCHA_SOLVER_MODE = (process.env.ZCODE_CAPTCHA_SOLVER || "auto").toLowerCase();
+const USE_PLAYWRIGHT = CAPTCHA_SOLVER_MODE !== "jsdom";
+const USE_JSDOM_FALLBACK = CAPTCHA_SOLVER_MODE !== "playwright";
+
+// Lazy-import Playwright solver so environments without the dependency
+// installed (e.g. legacy deployments that haven't run `bun install`
+// after upgrading) don't crash at module load.
+let _solveInPlaywright: typeof import("./captcha-playwright.js").solveInPlaywright | null = null;
+async function getPwSolver() {
+  if (!_solveInPlaywright) {
+    const mod = await import("./captcha-playwright.js");
+    _solveInPlaywright = mod.solveInPlaywright;
+  }
+  return _solveInPlaywright;
+}
+
 const CAPTCHA_HEADER = "x-aliyun-captcha-verify-param";
 const REGION_HEADER = "x-aliyun-captcha-verify-region";
 const CONFIGS_API = "https://zcode.z.ai/api/v1/client/configs";
@@ -230,12 +265,71 @@ export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: st
  * NEVER pre-empt a healthy solve — if the inner timeout is 40s, the outer
  * guard only fires at 50s, by which point the inner path has definitely
  * failed. This is a pure safety net, not a behavior change.
+ *
+ * v0.2.1.8+: RENAMED conceptually to solveCaptchaWithRetry. The function
+ * now dispatches between Playwright (default, high success rate) and JSDOM
+ * (fallback for environments without Chromium). The original JSDOM-only
+ * behavior is preserved when ZCODE_CAPTCHA_SOLVER=jsdom.
+ *
+ * Dispatch logic:
+ *   - USE_PLAYWRIGHT (default): try Playwright first. If it fails to LAUNCH
+ *     (binary missing, deps missing, OOM) AND USE_JSDOM_FALLBACK is true,
+ *     fall back to JSDOM for this attempt and all subsequent attempts in
+ *     this call (we set a flag to skip the launch probe on retries — once
+ *     Playwright is known-broken, retrying it wastes time).
+ *   - USE_JSDOM_FALLBACK only matters in "auto" mode. In "playwright" mode
+ *     (USE_JSDOM_FALLBACK=false), Playwright failures are surfaced as
+ *     retries (no JSDOM fallback).
+ *   - In "jsdom" mode (USE_PLAYWRIGHT=false), Playwright is never tried.
  */
 async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig, reqId?: string): Promise<string> {
   const tag = reqId ? `${reqId} ` : "";
   let lastErr: Error | null = null;
+  // Tracks whether Playwright has been observed to be unavailable in this
+  // call. Once true, we skip Playwright entirely on subsequent attempts
+  // (avoiding the launch probe delay on every retry).
+  let playwrightDisabled = !USE_PLAYWRIGHT;
+
   for (let attempt = 1; attempt <= SOLVE_RETRIES; attempt++) {
     try {
+      // Try Playwright first (if not disabled for this call).
+      if (!playwrightDisabled) {
+        try {
+          const solve = await getPwSolver();
+          const result = await solve(cfg, reqId);
+          return result;
+        } catch (err) {
+          // Classify the Playwright failure.
+          //   - "SDK fail: ..." → Aliyun REJECTED the verification (F001).
+          //     This is NOT a Playwright launch failure — the browser
+          //     worked, the SDK ran, Aliyun just said no. Retrying MAY
+          //     help (different fingerprint from new context). Don't
+          //     disable Playwright for this — just retry.
+          //   - "Target page, context or browser has been closed" /
+          //     "Browser has been closed" / "Executable doesn't exist" /
+          //     "Failed to launch" → Playwright is BROKEN in this
+          //     environment. Disable it for the rest of this call and
+          //     fall back to JSDOM (if allowed).
+          const msg = (err as Error).message ?? "";
+          const isLaunchFailure = /Executable doesn't exist|Failed to launch|browser has been closed|Browser has been closed|Target page, context or browser has been closed|playwright|chromium/i.test(msg)
+            && !/SDK fail/i.test(msg);
+          if (isLaunchFailure) {
+            console.warn(`${tag}[captcha] Playwright unavailable (${msg.substring(0, 120)}...), ${USE_JSDOM_FALLBACK ? "falling back to JSDOM" : "no fallback configured"} (attempt ${attempt}/${SOLVE_RETRIES})`);
+            playwrightDisabled = true;
+            if (!USE_JSDOM_FALLBACK) {
+              // No fallback — surface as a regular retry-able error.
+              throw err;
+            }
+            // Fall through to JSDOM path below.
+          } else {
+            // SDK-level failure (e.g. F001) or solve timeout — these are
+            // retry-able, NOT a Playwright environment issue.
+            throw err;
+          }
+        }
+      }
+
+      // JSDOM fallback path (also the primary path when ZCODE_CAPTCHA_SOLVER=jsdom).
       // v0.2.0.8: outer hard-timeout race. If solveInJsdom's internal
       // timeouts both fail to fire (jsdom edge case), this guarantee
       // ensures we still reject and the finally block runs to release the

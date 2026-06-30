@@ -22,6 +22,16 @@ WORKDIR /app
 # Copy only lock manifests so this layer caches across source edits.
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
+# v0.2.1.8+: Download Chromium binary for Playwright. The `postinstall`
+# script in package.json does this on `bun install`, but `--production`
+# skips scripts in some Bun versions — so we run it explicitly here to
+# be safe. The binary lands in node_modules/playwright-core/.local-browsers
+# and gets copied to the runtime stage with the rest of node_modules.
+#
+# Why not use a system Chromium package? Playwright pins to a specific
+# Chromium build it's tested against — using a system Chromium risks
+# version drift and missing CDP features the stealth plugin relies on.
+RUN bunx playwright install chromium
 
 # --- Stage 2: runtime --------------------------------------------------------
 FROM oven/bun:1.2-slim AS runtime
@@ -29,8 +39,29 @@ FROM oven/bun:1.2-slim AS runtime
 # tini: minimal init for proper SIGTERM forwarding + zombie reaping.
 # Render sends SIGTERM on scale-down; without tini, Bun might exit uncleanly
 # and lose in-flight SSE responses.
+#
+# v0.2.1.8+: Chromium system dependencies for Playwright headless.
+# The captcha solver now uses Playwright + stealth (real Chromium binary)
+# instead of JSDOM — Aliyun's risk control detects JSDOM with ~100%
+# accuracy (verifyCode F001 on every solve). Playwright needs these
+# shared libraries to launch headless Chromium.
+#
+# `playwright install-deps chromium` would install these automatically,
+# but that command requires playwright to be installed first (chicken-
+# and-egg with the multi-stage build). Listing them explicitly here means
+# the runtime stage doesn't need playwright's CLI at all — the deps are
+# system-level and the binary ships inside node_modules.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini \
+    && apt-get install -y --no-install-recommends \
+       tini \
+       # Chromium runtime deps (Playwright headless minimum set)
+       libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+       libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+       libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
+       libatspi2.0-0 libxshmfence1 \
+       # Font fallback (Aliyun SDK injects CSS that references CJK fonts;
+       # without these, canvas measurements return 0 and trigger detection)
+       fonts-noto-color-emoji fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # Render injects PORT at runtime. We default to 8080 for local `docker run`.

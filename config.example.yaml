@@ -170,6 +170,47 @@ retry:
   #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).
   credentialSwitchThreshold: 2
 
+# --- Captcha solver configuration (v0.2.1.8+) ---
+# Only relevant for `plan: start-plan`. coding-plan skips captcha entirely.
+#
+# Aliyun's captcha V3 (used by zcode.z.ai) is solved locally — the proxy
+# runs the Aliyun SDK in a browser-like environment and submits the
+# resulting verifyParam with each upstream request.
+#
+# Two solvers are available:
+#
+#   playwright (default, RECOMMENDED):
+#     Spawns a real headless Chromium via Playwright + stealth plugin.
+#     Passes Aliyun's bot-detection on first attempt. ~150MB resident
+#     memory for the singleton Chromium process; idle-closed after 5 min.
+#     Requires the Chromium system deps baked into the Dockerfile.
+#
+#   jsdom (legacy, WILL FAIL on current Aliyun risk control):
+#     Runs the SDK inside a JSDOM instance with polyfilled browser APIs.
+#     As of late 2024 Aliyun detects JSDOM with ~100% accuracy — every
+#     solve returns verifyCode F001. Kept only for debugging /
+#     environments where Chromium can't run (Free tier with <200MB free
+#     memory, no shell access to install deps, etc).
+#
+# Selection modes (env var: ZCODE_CAPTCHA_SOLVER):
+#   auto        (default) — Playwright first, fall back to jsdom if
+#                            Playwright fails to launch (binary missing,
+#                            deps missing, OOM). Best for mixed envs.
+#   playwright            — Playwright only, no fallback. Use this if you
+#                            want loud failures when Chromium is broken
+#                            (e.g. production where silent jsdom fallback
+#                            would just produce 503s anyway).
+#   jsdom                 — JSDOM only. Use only for debugging the legacy
+#                            path or comparing solver behavior.
+#
+# Other captcha env vars (rarely needed):
+#   ZCODE_CAPTCHA_RETRIES               — solve retries per attempt (default 3)
+#   ZCODE_CAPTCHA_TIMEOUT_MS            — per-solve timeout (default 40000)
+#   ZCODE_CAPTCHA_SDK_LOAD_MS           — SDK load timeout (default 20000)
+#   ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS     — config fetch timeout (default 15000)
+#   ZCODE_CAPTCHA_PW_IDLE_MS            — Playwright browser idle close
+#                                          (default 300000 = 5 min)
+
 # --- Responses thinking override (Codex CLI workaround) ---
 # Codex CLI frequently sends `reasoning: null` in the /v1/responses wire
 # payload (the CLI only populates it when an explicit effort level is forced

@@ -1,15 +1,19 @@
 {
   "name": "zcode-proxy",
-  "version": "0.2.1.7",
+  "version": "0.0.0.1",
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
     "test": "bun test",
-    "build": "bun build --compile --define \"require.resolve=undefined\" src/index.ts --outfile zcode-proxy.exe"
+    "build": "bun build --compile --define \"require.resolve=undefined\" src/index.ts --outfile zcode-proxy.exe",
+    "postinstall": "playwright install chromium"
   },
   "dependencies": {
     "jsdom": "^25.0.0",
+    "playwright": "^1.40.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

@@ -883,10 +883,32 @@ export async function proxyRequest(
   // inside the retry loop below via the same handleCaptchaChallenge() helper.
   if (currentPlan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
     upstreamResp = await handleCaptchaChallenge(upstreamResp);
-    // If captcha re-solve itself failed, bail out
+    // If captcha re-solve itself failed, bail out.
+    //
+    // v0.2.1.8 BUGFIX (ReadableStream is locked):
+    //   Previously this block called `await upstreamResp.text()` to inspect
+    //   the error JSON, then `return upstreamResp`. But `errorResponse()`
+    //   constructs the Response with a string body, which Bun wraps in a
+    //   single-consumer ReadableStream. Once `.text()` drains that stream,
+    //   the Response is "locked" — returning it to the server causes:
+    //     TypeError: ReadableStream is locked
+    //     at <anonymous> (native:1:11)
+    //   which surfaces as an unhandledRejection and breaks the client
+    //   connection (Claude Code / OpenAI SDK see a truncated response).
+    //
+    //   The fix: clone the Response *before* reading. `Response.clone()`
+    //   produces an independent copy whose body can be consumed without
+    //   locking the original. We then read the clone, and return the
+    //   pristine original to the server.
+    //
+    //   This also matches the pattern used elsewhere in this file (e.g.
+    //   the non-streaming JSON passthrough path) where the body is read
+    //   for stats but the Response is rebuilt for return.
     if (upstreamResp.status === 503 && upstreamResp.headers.get("content-type")?.includes("application/json")) {
+      // Clone FIRST so the original's body stays readable for return.
+      const probe = upstreamResp.clone();
       try {
-        const body = await upstreamResp.text();
+        const body = await probe.text();
         const parsed = JSON.parse(body);
         if (parsed?.error?.type === "captcha_solver_failed") {
           printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);

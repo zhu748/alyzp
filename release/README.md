@@ -1,5 +1,39 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.1 — Playwright 验证码 solver 根治阿里云风控 + 修复 ReadableStream is locked bug**
+>
+> 本次发版**彻底解决** start-plan 模式下验证码无法通过的问题。之前版本用 JSDOM 跑阿里云验证码 SDK,2024 年底阿里云风控升级后,JSDOM 环境被识别为机器人,每次 solve 都返回 `verifyCode F001`,导致所有 `/v1/messages` 请求 503 失败。
+>
+> **本次改动**
+>
+> - **新增 Playwright solver** (`src/proxy/captcha-playwright.ts`):
+>   - 用 `playwright-extra` + `puppeteer-extra-plugin-stealth` 跑真实 headless Chromium,通过 CDP 控制真实浏览器内核。
+>   - 单例 browser 复用,每次 solve 新建 BrowserContext 隔离指纹(避免阿里云关联多次尝试)。
+>   - 5 分钟 idle 自动关闭 browser,节省内存(对 Render Free tier 重要)。
+>   - 实测首次 solve 2.4 秒成功(JSDOM 路径 20-40 秒且必失败),verifyParam 280 字符,连续 3 次稳定通过。
+> - **修复 `ReadableStream is locked` unhandledRejection** (`src/proxy/handler.ts:884-919`):
+>   - start-plan 收到 403 captcha challenge 后调 `handleCaptchaChallenge` 返回 `errorResponse(503, ...)`,然后用 `await upstreamResp.text()` 读 body 判断错误类型,接着 `return upstreamResp`。
+>   - 但 `errorResponse()` 构造的 Response 内部是单次读取流,被 `.text()` 消费后 Response 进入 locked 状态,返回给 Bun.serve 时抛 `TypeError: ReadableStream is locked`,导致 unhandledRejection + 客户端连接被切断。
+>   - 修复:用 `upstreamResp.clone()` 先复制再读 clone,返回原始 Response。
+> - **改造 `src/proxy/captcha.ts` 调度逻辑**:
+>   - 默认走 Playwright(`ZCODE_CAPTCHA_SOLVER=auto`,Playwright 启动失败自动回退 JSDOM)。
+>   - `ZCODE_CAPTCHA_SOLVER=playwright` 强制 Playwright,不回退(适合生产环境,失败立即暴露)。
+>   - `ZCODE_CAPTCHA_SOLVER=jsdom` 强制 JSDOM(仅调试用)。
+>   - 错误分类:区分「Playwright 启动失败」(切 JSDOM) vs「SDK fail F001」(重试,可能换 context 就过)。
+> - **Dockerfile 加 Chromium 系统依赖**:`libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 libxshmfence1 fonts-noto-color-emoji fonts-noto-cjk`。deps stage 显式 `bunx playwright install chromium` 下载二进制。
+> - **`package.json` 新增依赖**:`playwright` / `playwright-extra` / `puppeteer-extra-plugin-stealth`。新增 `postinstall` 脚本自动 `playwright install chromium`。
+> - **新增 `scripts/test-captcha.ts`**:独立验证 solver 的 smoke test,一行命令 `bun run scripts/test-captcha.ts` 即可确认 Playwright + Chromium 装好且能过阿里云风控。
+> - **`config.example.yaml` 新增 captcha solver 配置文档**:说明三种模式(auto/playwright/jsdom)的差异 + 所有相关环境变量。
+> - **影响**:
+>   - **所有 start-plan 用户**:验证码不再失败,F001 错误消失。
+>   - **coding-plan 用户**:无影响(本来就跳过 captcha)。
+>   - **Render Free tier 用户**:内存可能紧张(Chromium 单例 ~150MB + Bun ~50MB),建议升 Starter ($7/mo, 512MB)。
+>   - **Docker 部署**:首次构建镜像会下载 Chromium 二进制(~150MB),构建时间增加 1-2 分钟,运行时磁盘多占 ~200MB。
+>
+> **升级建议**:所有在 start-plan 模式遇到 `verifyCode F001` / `captcha verify failed` / `ReadableStream is locked` 错误的用户立即升级。coding-plan 用户可选升级(无影响)。
+
+---
+
 > **v0.2.1.7 — SSE heartbeat 保活:解决 Cloudflare 524 超时 + 修复压缩流 bug + admin API 增强**
 >
 > 解决 Cloudflare 524 超时问题:当代理部署在 CF 后面时,GLM-5.2 thinking 模式经常需要 60-180 秒才吐第一个 SSE event,超过 CF 的 100 秒 Proxy Read Timeout,CF 直接返回 524 切断连接。本版本通过在等待上游首字节期间定期 flush SSE 标准注释行(`: keepalive\n\n`)保活,完全解决此问题。
