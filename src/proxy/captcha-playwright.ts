@@ -152,36 +152,49 @@ async function acquireBrowser(): Promise<import("playwright").Browser> {
       // This MUST happen before chromium.launch() — Playwright reads
       // PLAYWRIGHT_BROWSERS_PATH at launch time, not at import time.
       ensureChromiumPath();
-      // Pure playwright — no playwright-extra, no stealth plugin.
-      // Stealth is handled by STEALTH_EVASIONS via addInitScript.
+
+      // v0.0.0.5: Use executablePath to directly point at the bundled
+      // chrome.exe. This bypasses Playwright's browser lookup logic
+      // entirely (which involves Registry lookups, browsers.json parsing,
+      // channel resolution — all of which can hang or fail in exe mode).
       //
-      // args rationale:
-      //   --no-sandbox            : required when running as non-root in
-      //                              Docker (the Dockerfile uses uid 1001)
-      //   --disable-setuid-sandbox: same reason
-      //   --disable-dev-shm-usage : Render Free's /dev/shm is small (64MB);
-      //                              Chrome defaults to /dev/shm for shared
-      //                              memory and crashes on OOM. This flag
-      //                              forces /tmp instead (larger but slower).
-      //   --disable-blink-features=AutomationControlled :
-      //                              removes navigator.webdriver and the
-      //                              "Chrome is being controlled by automated
-      //                              software" infobar. Defense in depth
-      //                              (STEALTH_EVASIONS also patches this).
-      //   --disable-extensions    : extensions leak automation signals
-      //   --disable-gpu           : headless doesn't need GPU; avoids driver
-      //                              crashes on Render containers
-      return await chromium.launch({
+      // We compute the path from PLAYWRIGHT_BROWSERS_PATH (which start.bat
+      // / start.sh sets to the zip's chromium/ directory). The layout is:
+      //   <PLAYWRIGHT_BROWSERS_PATH>/chromium-1228/chrome-win64/chrome.exe  (Windows)
+      //   <PLAYWRIGHT_BROWSERS_PATH>/chromium-1228/chrome-linux64/chrome   (Linux)
+      //
+      // If the file doesn't exist, we fall back to letting Playwright find
+      // it (which works in source mode after `playwright install chromium`).
+      const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
+      let executablePath: string | undefined;
+      if (browsersPath) {
+        // Also check if the exe is running on Windows even if platform
+        // detection is off (bun build --compile can mismatch).
+        const candidates = [
+          join(browsersPath, "chromium-1228", "chrome-win64", "chrome.exe"),
+          join(browsersPath, "chromium-1228", "chrome-linux64", "chrome"),
+        ];
+        for (const c of candidates) {
+          if (existsSync(c)) {
+            executablePath = c;
+            break;
+          }
+        }
+        if (executablePath) {
+          console.log(`[captcha] Using bundled Chromium: ${executablePath}`);
+        } else {
+          console.warn(`[captcha] Bundled Chromium not found under ${browsersPath}, falling back to Playwright default search`);
+        }
+      }
+
+      console.log("[captcha] Launching Chromium...");
+      const launchStart = Date.now();
+      const browser = await chromium.launch({
         headless: true,
-        // v0.0.0.3 CRITICAL: channel="chromium" forces Playwright to use
-        // the FULL Chromium binary (chromium-1228/chrome-win64/chrome.exe)
-        // instead of the headless shell (chromium_headless_shell-1228/).
-        // Without this, Playwright looks for chrome-headless-shell which
-        // we don't bundle (it's a separate ~80MB download and lacks some
-        // APIs the stealth plugin needs). Full Chromium works identically
-        // in headless mode and is what puppeteer-extra-plugin-stealth was
-        // designed for.
-        channel: "chromium",
+        // v0.0.0.5: Direct executablePath instead of channel="chromium".
+        // channel="chromium" caused 70s timeout in Windows exe mode
+        // (Playwright's channel resolution hung). Direct path is reliable.
+        ...(executablePath ? { executablePath } : {}),
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -191,9 +204,9 @@ async function acquireBrowser(): Promise<import("playwright").Browser> {
           "--disable-gpu",
         ],
       });
+      console.log(`[captcha] Chromium launched in ${Date.now() - launchStart}ms`);
+      return browser;
     })().catch((err) => {
-      // If launch fails, clear the cached promise so the NEXT call
-      // can retry (instead of permanently returning a rejected promise).
       browserPromise = null;
       throw err;
     });
@@ -426,14 +439,22 @@ async function solveInPlaywrightInner(cfg: FetchedCaptchaConfig): Promise<string
       "<!DOCTYPE html><html><head><script>" + stealthSafe + "</script></head>" +
       "<body><div id=\"captcha-element\"></div><button id=\"captcha-button\"></button>" +
       "<script>" + sdkSafe + "</script></body></html>";
+
+    // v0.0.0.5: diagnostic logs at each step to identify where it hangs
+    console.log("[captcha] setContent...");
+    const t1 = Date.now();
     await page.setContent(html, { waitUntil: "domcontentloaded" });
+    console.log(`[captcha] setContent done in ${Date.now() - t1}ms`);
 
     // Wait for the SDK to expose initAliyunCaptcha. Real Chromium runs
     // the SDK much faster than JSDOM (no vm boundary), usually <500ms.
+    console.log("[captcha] waiting for SDK to load...");
+    const t2 = Date.now();
     await page.waitForFunction(
       () => typeof (window as any).initAliyunCaptcha === "function",
       { timeout: SDK_LOAD_TIMEOUT_MS },
     );
+    console.log(`[captcha] SDK loaded in ${Date.now() - t2}ms`);
 
     // Call initAliyunCaptcha and await the success callback.
     //
@@ -441,6 +462,8 @@ async function solveInPlaywrightInner(cfg: FetchedCaptchaConfig): Promise<string
     // see Node.js-side variables (SOLVE_TIMEOUT_MS, etc). All values
     // must be passed as the second argument to evaluate(), which becomes
     // the function's parameter inside the browser.
+    console.log("[captcha] calling initAliyunCaptcha...");
+    const t3 = Date.now();
     const verifyParam = await page.evaluate(async ({ captchaCfg, solveTimeoutMs }: { captchaCfg: FetchedCaptchaConfig; solveTimeoutMs: number }) => {
       return new Promise<string>((resolve, reject) => {
         const t = (window as any);
@@ -484,6 +507,7 @@ async function solveInPlaywrightInner(cfg: FetchedCaptchaConfig): Promise<string
         });
       });
     }, { captchaCfg: cfg, solveTimeoutMs: SOLVE_TIMEOUT_MS });
+    console.log(`[captcha] initAliyunCaptcha returned in ${Date.now() - t3}ms, verifyParam length: ${verifyParam.length}`);
 
     return verifyParam;
   } finally {

@@ -1,5 +1,34 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.5 — 用 executablePath 直接指定 chrome.exe, 绕过 channel 导致的 70s 超时**
+>
+> v0.0.0.4 修复了 `chromium undefined` 的问题, 但启动后 solve 卡 70 秒超时 (`hard-guard timeout after 70000ms`)。根因是 `channel: "chromium"` 选项在 Windows exe 模式下触发 Playwright 的 channel 解析逻辑, 该逻辑在 exe 里会 hang。本版本用 `executablePath` 直接指定 chrome.exe 路径, 彻底绕过 Playwright 的浏览器查找逻辑。
+>
+> **本次改动**
+>
+> - **根因: `channel: "chromium"` 在 Windows exe 下 hang**
+>   - v0.0.0.3 加了 `channel: "chromium"` 强制用完整 Chromium (而非 headless shell)
+>   - 在源码模式工作正常, 但在 exe 模式下 Playwright 的 channel 解析会 hang (可能涉及 Windows Registry 查找 / browsers.json 二次解析, 在 patch 后的 coreBundle.js 里死循环)
+>   - 结果: `chromium.launch()` 的 promise 永远 pending, 70 秒后 hard-guard 超时
+>
+> - **修复: 用 `executablePath` 直接指定 chrome.exe**
+>   - 从 `PLAYWRIGHT_BROWSERS_PATH` 环境变量构造完整路径: `<browsersPath>/chromium-1228/chrome-win64/chrome.exe` (Windows) 或 `chrome-linux64/chrome` (Linux)
+>   - 用 `existsSync()` 验证文件存在, 存在就传 `executablePath` 给 `chromium.launch()`
+>   - 不存在则回退到 Playwright 默认查找 (源码模式用)
+>   - 完全绕过 channel 解析 / browsers.json 查找 / Registry 查找
+>
+> - **加诊断日志**: 在 solve 流程每一步打时间戳
+>   - `[captcha] Launching Chromium...` / `Chromium launched in Xms`
+>   - `[captcha] setContent...` / `setContent done in Xms`
+>   - `[captcha] waiting for SDK to load...` / `SDK loaded in Xms`
+>   - `[captcha] calling initAliyunCaptcha...` / `initAliyunCaptcha returned in Xms`
+>   - 本地实测: launch 145ms + setContent 331ms + SDK load 36ms + solve 921ms = 总 2.5s
+>   - 如果还卡, 日志能精确告诉用户卡在哪一步
+>
+> **升级建议**: 所有 v0.0.0.4 用户立即升级。v0.0.0.4 的 exe 启动后 captcha 必超时 (70s), v0.0.0.5 修复。
+
+---
+
 > **v0.0.0.4 — 修复 playwright-core __dirname 在 exe 模式下路径硬编码导致 chromium undefined**
 >
 > v0.0.0.3 的 zip 解压后启动, Chromium 路径能找到了, 但 `chromium.launch()` 仍然失败, 报 `Cannot find module '\home\runner\work\alyzp\alyzp\node_modules\playwright-core\package.json'`。本版本通过编译时 patch 彻底解决。
