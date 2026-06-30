@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# v0.0.0.3: Chromium is now bundled in the zip under chromium/ directory.
+# No separate installation needed - just extract and run.
+#
+# We set PLAYWRIGHT_BROWSERS_PATH to point at the bundled chromium/
+# directory so Playwright finds chrome (or chrome.exe on Windows via
+# WSL) without needing a system install. The captcha-playwright.ts
+# module also auto-detects ./chromium if this env var is missing, but
+# setting it explicitly works even if the user runs from another CWD.
+
+# Resolve the script's own directory (zip extraction folder).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PLAYWRIGHT_BROWSERS_PATH="${SCRIPT_DIR}/chromium"
 
 echo ""
 echo "============================================"
@@ -17,7 +29,6 @@ echo "  9. Import key from ZCode (Z.AI) - Start Plan"
 echo "  a. Check login status"
 echo "  b. Logout"
 echo "  c. Export credential for Render/cloud deploy"
-echo "  i. Install/Update Chromium (for start-plan captcha)"
 echo "  0. Exit"
 echo ""
 read -p "Select: " choice
@@ -27,8 +38,7 @@ case $choice in
     echo ""
     echo "Starting proxy server..."
     echo ""
-    echo "(If start-plan captcha fails with 'Executable doesn't exist',"
-    echo " run option i first to install Chromium.)"
+    echo "(Chromium bundled at: $PLAYWRIGHT_BROWSERS_PATH)"
     echo ""
     chmod +x zcode-proxy.exe
     ./zcode-proxy.exe serve config.yaml
@@ -99,31 +109,6 @@ case $choice in
     echo "(Used for Render / Fly.io / K8s deployment in oauth mode)"
     echo ""
     ./zcode-proxy.exe auth export
-    ;;
-  i)
-    echo ""
-    echo "============================================"
-    echo " Installing Chromium for Playwright captcha"
-    echo "============================================"
-    echo ""
-    echo "This downloads ~150MB Chromium binary to:"
-    echo "  \$HOME/.cache/ms-playwright/  (Linux)"
-    echo "  \$HOME/Library/Caches/ms-playwright/  (macOS)"
-    echo ""
-    echo "Required only for start-plan mode. Coding-plan users can skip."
-    echo ""
-    if command -v bun >/dev/null 2>&1; then
-      echo "Found bun, using it to install Chromium..."
-      bunx playwright install chromium
-    elif command -v npx >/dev/null 2>&1; then
-      echo "Found npx, using it to install Chromium..."
-      npx playwright install chromium
-    else
-      echo "ERROR: Neither bun nor npx found in PATH."
-      echo "Install Bun from https://bun.sh/ or Node.js from https://nodejs.org/"
-      echo "Then re-run this option."
-    fi
-    echo ""
     ;;
   0)
     exit 0

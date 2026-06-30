@@ -41,6 +41,8 @@
  * get it via the `postinstall` script in package.json.
  */
 import { chromium } from "playwright";
+import { existsSync } from "fs";
+import { join } from "path";
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import STEALTH_EVASIONS from "./stealth-evasions.js.txt" with { type: "text" };
 
@@ -56,6 +58,46 @@ const HARD_GUARD_MS = SOLVE_TIMEOUT_MS + SDK_LOAD_TIMEOUT_MS + 10_000;
 const FAKE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 interface FetchedCaptchaConfig { enabled: boolean; prefix: string; sceneId: string; region: string; }
+
+/**
+ * v0.0.0.3: Locate the bundled Chromium binary.
+ *
+ * Priority:
+ *   1. PLAYWRIGHT_BROWSERS_PATH env var (set by start.bat / start.sh to
+ *      point at the chromium/ directory in the zip extraction folder).
+ *      Playwright reads this natively — we just need to make sure it's
+ *      set before chromium.launch() is called.
+ *
+ *   2. ./chromium/ relative to CWD (zip extraction folder layout).
+ *      If PLAYWRIGHT_BROWSERS_PATH is NOT set, but ./chromium/ exists,
+ *      set PLAYWRIGHT_BROWSERS_PATH=./chromium before launch. This is
+ *      the "extract-and-run" path — no env var config needed.
+ *
+ *   3. Playwright's default search path (system cache like
+ *      ~/.cache/ms-playwright/ on Linux, %USERPROFILE%\AppData\Local\
+ *      ms-playwright\ on Windows). Used when running from source
+ *      (`bun run src/index.ts`) after `playwright install chromium`.
+ *
+ * This function MUST be called before chromium.launch(). It mutates
+ * process.env.PLAYWRIGHT_BROWSERS_PATH as a side effect.
+ */
+function ensureChromiumPath(): void {
+  // Already set — nothing to do.
+  if (process.env.PLAYWRIGHT_BROWSERS_PATH) return;
+
+  // Check for ./chromium/ relative to CWD (zip extraction folder).
+  // The zip bundles Chromium at chromium/chromium-1228/chrome-win64/chrome.exe
+  // on Windows, chromium/chromium-1228/chrome-linux64/chrome on Linux.
+  const localChromiumDir = join(process.cwd(), "chromium");
+  if (existsSync(localChromiumDir)) {
+    process.env.PLAYWRIGHT_BROWSERS_PATH = localChromiumDir;
+    return;
+  }
+
+  // Fall through to Playwright's default search path.
+  // This works if the user ran `playwright install chromium` (via
+  // `start.bat` option i in v0.0.0.2, or via `bun install` postinstall).
+}
 
 // === Singleton browser management ===
 
@@ -106,6 +148,10 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null;
 async function acquireBrowser(): Promise<import("playwright").Browser> {
   if (!browserPromise) {
     browserPromise = (async () => {
+      // v0.0.0.3: Ensure Playwright can find the bundled Chromium.
+      // This MUST happen before chromium.launch() — Playwright reads
+      // PLAYWRIGHT_BROWSERS_PATH at launch time, not at import time.
+      ensureChromiumPath();
       // Pure playwright — no playwright-extra, no stealth plugin.
       // Stealth is handled by STEALTH_EVASIONS via addInitScript.
       //
@@ -127,6 +173,15 @@ async function acquireBrowser(): Promise<import("playwright").Browser> {
       //                              crashes on Render containers
       return await chromium.launch({
         headless: true,
+        // v0.0.0.3 CRITICAL: channel="chromium" forces Playwright to use
+        // the FULL Chromium binary (chromium-1228/chrome-win64/chrome.exe)
+        // instead of the headless shell (chromium_headless_shell-1228/).
+        // Without this, Playwright looks for chrome-headless-shell which
+        // we don't bundle (it's a separate ~80MB download and lacks some
+        // APIs the stealth plugin needs). Full Chromium works identically
+        // in headless mode and is what puppeteer-extra-plugin-stealth was
+        // designed for.
+        channel: "chromium",
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",

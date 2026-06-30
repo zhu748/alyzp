@@ -1,5 +1,42 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.3 — Chromium 内置到 zip, 解压即用, 零配置**
+>
+> v0.0.0.2 修复了 exe 模式下 Playwright solver 崩溃的问题, 但用户还需要手动跑 `start.bat` 选项 `i` 安装 ~150MB Chromium binary。本版本直接把 Chromium 打包进 zip, 用户解压后双击 `start.bat` 选 `1` 就能立即启动, 完全零配置。
+>
+> **本次改动**
+>
+> - **Chromium 直接打包进 zip**:
+  - GitHub Actions workflow 新增 `Download Windows Chromium binary` 步骤: 从 `cdn.playwright.dev/builds/cft/149.0.7827.55/win64/chrome-win64.zip` 下载 Playwright pin 的 Chromium revision 1228 (Chrome for Testing 149.0.7827.55), 解压到 `release/chromium/chromium-1228/chrome-win64/`, 写 `INSTALLATION_COMPLETE` + `DEPENDENCIES_VALIDATED` marker (Playwright 启动时检查这两个文件, 没有会触发重新安装)
+  - zip 打包步骤加入 `chromium/` 目录, zip 从 ~107MB 涨到 ~260MB
+  - workflow timeout 从 20 分钟提到 30 分钟 (多下载 + 打包时间)
+>
+> - **`captcha-playwright.ts` 智能定位 Chromium**:
+  - 新增 `ensureChromiumPath()` 函数, 在 `chromium.launch()` 前调
+  - 优先级 1: `PLAYWRIGHT_BROWSERS_PATH` 环境变量 (start.bat / start.sh 显式设)
+  - 优先级 2: `./chromium/` 相对 CWD (zip 解压目录自动检测, 无需任何配置)
+  - 优先级 3: Playwright 默认搜索路径 (源码模式 `bun run src/index.ts` 用)
+>
+> - **`chromium.launch()` 加 `channel: "chromium"`**:
+  - Playwright 默认用 `chromium-headless-shell` (轻量版, ~80MB), 但我们只打包了完整 Chromium (~150MB)
+  - 设 `channel: "chromium"` 强制用完整 Chromium binary, 不找 headless shell
+  - 完整 Chromium 也是 stealth 插件设计的目标环境
+>
+> - **`start.bat` / `start.sh` 重写**:
+  - 删除选项 `i` (不再需要手动安装 Chromium)
+  - 启动前自动设 `PLAYWRIGHT_BROWSERS_PATH` 指向解压目录的 `chromium/` 子目录
+  - `start.bat` 用 `%~dp0` 解析自身路径, 即使用户从其他目录双击也能正确找到
+  - `start.sh` 用 `BASH_SOURCE` + `cd` 解析脚本目录
+>
+> - **本地验证**:
+  - 模拟 zip 布局 (软链接已装 Chromium 到 `./chromium/`), 跑 `test-captcha.ts` 成功 (2.6s, 280 字符 verifyParam)
+  - CWD 自动检测模式也成功 (不设 env var, 只靠 `./chromium/` 存在)
+  - 684 单测全过, tsc 零错误, Windows exe 编译成功
+>
+> **升级建议**: 所有 v0.0.0.2 用户立即升级。v0.0.0.2 需要手动装 Chromium, v0.0.0.3 解压即用。zip 大小增加 ~150MB, 下载时间多 ~30 秒, 但省去用户所有配置步骤。
+
+---
+
 > **v0.0.0.2 — 修复 exe 模式下 Playwright solver 崩溃 (kind-of / stealth 插件 require 失败)**
 >
 > v0.0.0.1 的 Playwright solver 在源码模式 (`bun run src/index.ts`) 下能跑通,但编译成 Windows exe (`bun build --compile`) 后完全崩溃。本版本彻底重写 solver,确保 exe 模式也能正常 solve 验证码。

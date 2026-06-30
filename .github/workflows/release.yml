@@ -31,7 +31,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30  # v0.0.0.3+: was 20, raised to 30 due to Chromium download + zip
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,6 +118,56 @@ jobs:
           file release/zcode-proxy.exe | grep -q "PE32" || { \
             echo "::error::Compiled binary is not a Windows PE32+ executable. Did you forget --target=bun-windows-x64?"; exit 1; }
 
+      - name: Download Windows Chromium binary (bundled in zip)
+        run: |
+          # v0.0.0.3+: Bundle Chromium directly in the release zip so users
+          # don't need to run `playwright install chromium` separately.
+          # Extract-and-run, zero setup.
+          #
+          # We download the SAME Chromium revision Playwright pins to
+          # (revision 1228 = Chrome for Testing 149.0.7827.55), unpack it
+          # into release/chromium/chromium-1228/chrome-win64/ — this matches
+          # the layout Playwright expects when PLAYWRIGHT_BROWSERS_PATH is
+          # set to release/chromium/.
+          #
+          # URL pattern: https://cdn.playwright.dev/builds/cft/<ver>/<platform>/chrome-<platform>.zip
+          # Verified via `bunx playwright install --dry-run chromium`.
+          CFT_VERSION="149.0.7827.55"
+          PW_REVISION="1228"
+          mkdir -p release/chromium/chromium-${PW_REVISION}
+          cd release/chromium/chromium-${PW_REVISION}
+
+          echo "Downloading Chromium ${CFT_VERSION} (revision ${PW_REVISION}) for Windows..."
+          curl -L -o chrome-win64.zip \
+            "https://cdn.playwright.dev/builds/cft/${CFT_VERSION}/win64/chrome-win64.zip"
+          
+          echo "Verifying download..."
+          # chrome-win64.zip should be ~150MB. Sanity check > 50MB.
+          SIZE=$(stat -c %s chrome-win64.zip 2>/dev/null || stat -f %z chrome-win64.zip)
+          if [ "$SIZE" -lt 50000000 ]; then
+            echo "::error::Chromium download too small (${SIZE} bytes). Aborting."
+            exit 1
+          fi
+          echo "Downloaded ${SIZE} bytes."
+
+          echo "Extracting..."
+          unzip -q chrome-win64.zip
+          rm chrome-win64.zip
+
+          # Verify chrome.exe exists
+          ls -la chrome-win64/chrome.exe
+          echo "Chromium extracted to release/chromium/chromium-${PW_REVISION}/chrome-win64/"
+
+          # Write INSTALLATION_COMPLETE marker — Playwright checks this
+          # to decide whether the browser is "installed". Without it,
+          # Playwright tries to re-install on first launch.
+          touch INSTALLATION_COMPLETE
+          touch DEPENDENCIES_VALIDATED
+
+          cd ../..
+          echo "Chromium bundle size:"
+          du -sh chromium/
+
       - name: Stage config.yaml from template
         run: cp config.example.yaml release/config.yaml
 
@@ -140,10 +190,16 @@ jobs:
         run: |
           V="${{ steps.ver.outputs.version }}"
           cd release
-          zip -9 "../zcode-proxy-v${V}.zip" \
-            zcode-proxy.exe config.yaml start.bat start.sh README.md
+          # v0.0.0.3+: zip includes chromium/ directory (bundled browser)
+          # so users get extract-and-run, zero setup. Zip size grows from
+          # ~107MB (exe only) to ~260MB (exe + chromium).
+          zip -9 -r "../zcode-proxy-v${V}.zip" \
+            zcode-proxy.exe config.yaml start.bat start.sh README.md chromium/
           cd ..
           ls -lh "zcode-proxy-v${V}.zip"
+          echo ""
+          echo "Zip contents:"
+          unzip -l "zcode-proxy-v${V}.zip" | tail -5
 
       - name: Create GitHub Release and upload zip
         uses: softprops/action-gh-release@v2
