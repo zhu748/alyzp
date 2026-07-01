@@ -198,13 +198,37 @@ async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
       const userDataDir = process.env.PLAYWRIGHT_BROWSERS_PATH
         ? join(process.env.PLAYWRIGHT_BROWSERS_PATH, "..", "pw-profile")
         : join(tmpdir(), "zcode-pw-profile");
-      const browser = await chromium.launchPersistentContext(userDataDir, {
+      const launchOptions: Record<string, unknown> = {
         headless: true,
         // v0.0.0.6: Explicit timeout — if launch hangs (Chrome for Testing
         // on Windows Server can hang on first-run checks / Google Update
         // service / default browser check), fail fast at 30s instead of
         // waiting 70s for the hard-guard.
         timeout: 30_000,
+        // v0.0.0.7 CRITICAL: Force TCP port mode instead of pipe mode.
+        //
+        // Playwright defaults to pipe mode (--remote-debugging-pipe) which
+        // communicates with chrome via stdin/stdout. This is faster but
+        // requires proper stdio handle inheritance to child processes.
+        //
+        // Bun's compiled exe (bun build --compile --target=bun-windows-x64)
+        // has a bug where stdio pipes to child processes don't work correctly
+        // on Windows — chrome starts (we can see it in Task Manager) but
+        // Playwright can't communicate with it via the pipe, causing a 30s
+        // hang then "Timeout 30000ms exceeded" error.
+        //
+        // pipe:false makes Playwright use --remote-debugging-port=0 instead,
+        // which uses TCP (127.0.0.1:<random-port>). TCP doesn't depend on
+        // stdio inheritance, so it works reliably in compiled exe mode.
+        //
+        // Trade-off: TCP is ~10ms slower per CDP round-trip than pipe, but
+        // for captcha solving (which only does ~5 CDP calls) this is
+        // negligible (~50ms total overhead).
+        //
+        // Note: `pipe` is not in Playwright's TypeScript LaunchOptions type
+        // definition, but it IS supported at runtime (see playwright-core
+        // source). Using Record<string, unknown> to bypass the type check.
+        pipe: false,
         // Context-level options (launchPersistentContext returns a context,
         // so UA / locale / viewport go here, not in newContext()).
         userAgent: FAKE_UA,
@@ -234,7 +258,11 @@ async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
           "--disable-component-extensions-with-background-pages",
           "--disable-features=TranslateUI",
         ],
-      });
+      };
+      const browser = await chromium.launchPersistentContext(
+        userDataDir,
+        launchOptions as import("playwright").BrowserContextOptions,
+      );
       console.log(`[captcha] Chromium launched in ${Date.now() - launchStart}ms`);
 
       // v0.0.0.6: Inject stealth init scripts ONCE at context creation

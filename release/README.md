@@ -1,5 +1,34 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.7 — 修复 Bun exe 在 Windows 下 stdio 管道 bug (pipe:false 强制 TCP 模式)**
+>
+> v0.0.0.6 仍然卡在 `Launching Chromium...` 30 秒后超时。手动测试发现 chrome.exe 本身能正常启动 (`DevTools listening on ws://127.0.0.1:9222/...`), 问题出在 Playwright 连不上 chrome。根因: Bun 编译的 exe 在 Windows 上 stdio 管道继承有 bug, Playwright 默认用 pipe 模式 (`--remote-debugging-pipe` 通过 stdin/stdout 通信) 连不上 chrome。本版本用 `pipe: false` 强制 TCP 端口模式。
+>
+> **本次改动**
+>
+> - **根因: Bun exe 在 Windows 下 stdio 管道继承 bug**
+>   - Playwright 默认用 pipe 模式: 给 chrome 加 `--remote-debugging-pipe` flag, 通过 chrome 的 stdin/stdout 通信 (比 TCP 快 ~10ms/round-trip)
+>   - Bun 的 `bun build --compile --target=bun-windows-x64` 编译出的 exe 在 spawn 子进程时, stdio 管道继承不正确
+>   - 结果: chrome 进程启动了 (Task Manager 能看到), 但 Playwright 通过 stdin/stdout 发的 CDP 命令到不了 chrome, chrome 的响应也回不来
+>   - Playwright 等 30 秒后超时报 `Timeout 30000ms exceeded`
+>
+> - **诊断过程** (感谢用户配合手动测试):
+>   1. 用户手动跑 `chrome.exe --headless --dump-dom about:blank` → 输出 `<html><head></head><body></body></html>` → chrome 本身正常
+>   2. 用户手动跑 `chrome.exe --remote-debugging-port=9222 ...` → 输出 `DevTools listening on ws://127.0.0.1:9222/...` → 调试端口能开
+>   3. 结论: chrome 没问题, 是 Playwright 连不上 → 指向 pipe 模式问题
+>
+> - **修复: `pipe: false` 强制 TCP 端口模式**
+>   - Playwright 加 `--remote-debugging-port=0` (而不是 `--remote-debugging-pipe`), chrome 开一个随机 TCP 端口
+>   - Playwright 通过 `127.0.0.1:<port>` TCP 连 chrome, 不依赖 stdio 管道
+>   - `pipe` 选项不在 Playwright 的 TypeScript 类型定义里, 但运行时支持 (见 playwright-core 源码)。用 `Record<string, unknown>` + `as BrowserContextOptions` 绕过类型检查
+>   - 代价: TCP 比 pipe 慢 ~10ms/CDP round-trip, 但 captcha 只做 ~5 次 CDP 调用, 总开销 ~50ms, 可忽略
+>
+> - **本地实测**: launch 145ms + setContent 285ms + SDK 35ms + solve 800ms = 总 2.4s (和 pipe 模式无差别)
+>
+> **升级建议**: 所有 v0.0.0.6 用户立即升级。v0.0.0.6 在 Windows exe 下 Chromium 启动必超时 (30s), v0.0.0.7 修复。
+
+---
+
 > **v0.0.0.6 — 修复 Chromium 在 Windows exe 下启动 hang (launchPersistentContext + 首次启动跳过)**
 >
 > v0.0.0.5 修复了 channel 导致的 hang, 但用户反馈 `Launching Chromium...` 后仍然卡住。根因是 Chrome for Testing 在 Windows Server / Administrator 账户下首次启动时会尝试访问 Google Update 服务 / 默认浏览器检查 / 创建 user data dir, 这些操作在精简 Windows 环境下会阻塞 60+ 秒。本版本用 `launchPersistentContext` + 一堆 `--no-first-run` flag 彻底解决。
