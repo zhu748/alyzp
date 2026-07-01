@@ -1,5 +1,23 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.10 — 加 stealth 诊断日志, 定位 F001 失败原因**
+>
+> v0.0.0.9 终于让 Chrome 在 Windows exe 下正常启动了 (chrome DevTools ready + CDP 连接 + SDK 加载都成功), 但 solve 仍然返回 F001 (Aliyun 风控拒绝)。本版本加诊断日志, 在 solve 前打印所有 stealth 关键指标的值, 帮助定位是哪个指纹属性被阿里云检测到。
+>
+> **本次改动**
+>
+> - **在 `captcha-cdp.ts` 的 solve 流程加 stealth check 诊断**:
+>   - SDK 加载后、调 `initAliyunCaptcha` 前, 用 `Runtime.evaluate` 读 14 个关键指纹属性
+>   - 打印 JSON: `webdriver`, `chrome`, `chromeRuntime`, `plugins.length`, `languages.length`, `vendor`, `platform`, `hardwareConcurrency`, `uaDataBrands`, `uaDataPlatform`, `webglVendor`, `outerWidth`, `outerHeight`
+>   - 本地 Linux 测试全绿: `webdriver:false, chrome:object, chromeRuntime:object, plugins:5, platform:Win32, uaDataPlatform:Windows`
+>   - Windows 用户的日志会显示哪个属性不对 → 精确定位 stealth 失效点
+>
+> - **本地实测**: 3.6s solve 成功, stealth check 全绿
+>
+> **下一步**: 用户跑 v0.0.0.10 后, 把 `[captcha] stealth check: {...}` 这行日志贴给我。根据哪个属性不对, 针对性修复。
+>
+> ---
+
 > **v0.0.0.9 — 彻底抛弃 Playwright, 用纯 CDP 协议直连 Chrome**
 >
 > v0.0.0.7 的 `pipe: false` 没生效, 仍然 30 秒超时。诊断发现 Playwright 在 Bun 下有 3 个连续的 bug, 逐个修复后仍然失败。本版本完全抛弃 Playwright, 用 Bun 原生 WebSocket + 手写 CDP (Chrome DevTools Protocol) 命令直连 Chrome, 彻底解决所有问题。

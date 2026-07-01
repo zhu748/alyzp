@@ -297,6 +297,32 @@ export async function solveInPlaywright(cfg: FetchedCaptchaConfig, _reqId?: stri
   }
   console.log(`[captcha] SDK loaded in ${Date.now() - t2}ms`);
 
+  // v0.0.0.10: Diagnose stealth patch effectiveness. If F001 persists,
+  // this log shows exactly which fingerprint property Aliyun is detecting.
+  try {
+    const diag = await sendCDPSession(ws, sessionId, "Runtime.evaluate", {
+      expression: `JSON.stringify({
+        webdriver: navigator.webdriver,
+        chrome: typeof window.chrome,
+        chromeRuntime: typeof window.chrome?.runtime,
+        plugins: navigator.plugins?.length,
+        languages: navigator.languages?.length,
+        vendor: navigator.vendor,
+        platform: navigator.platform,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        uaDataBrands: navigator.userAgentData?.brands?.length,
+        uaDataPlatform: navigator.userAgentData?.platform,
+        webglVendor: (function(){ try { var c=document.createElement('canvas').getContext('webgl'); return c?c.getParameter(37445):null; } catch(e){ return 'err:'+e.message; } })(),
+        outerWidth: window.outerWidth,
+        outerHeight: window.outerHeight,
+      })`,
+      returnByValue: true,
+    }) as { result: { value: string } };
+    console.log(`[captcha] stealth check: ${diag.result.value}`);
+  } catch (e) {
+    console.log(`[captcha] stealth check failed: ${(e as Error).message}`);
+  }
+
   // Call initAliyunCaptcha and await the success callback
   console.log("[captcha] calling initAliyunCaptcha...");
   const t3 = Date.now();
