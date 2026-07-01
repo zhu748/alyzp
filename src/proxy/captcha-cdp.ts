@@ -299,6 +299,8 @@ export async function solveInPlaywright(cfg: FetchedCaptchaConfig, _reqId?: stri
 
   // v0.0.0.10: Diagnose stealth patch effectiveness. If F001 persists,
   // this log shows exactly which fingerprint property Aliyun is detecting.
+  // v0.0.0.11: Expanded to include behavioral signals (visibility, focus,
+  // mouse events, RAF timing) — Aliyun traceless mode checks these too.
   try {
     const diag = await sendCDPSession(ws, sessionId, "Runtime.evaluate", {
       expression: `JSON.stringify({
@@ -315,6 +317,27 @@ export async function solveInPlaywright(cfg: FetchedCaptchaConfig, _reqId?: stri
         webglVendor: (function(){ try { var c=document.createElement('canvas').getContext('webgl'); return c?c.getParameter(37445):null; } catch(e){ return 'err:'+e.message; } })(),
         outerWidth: window.outerWidth,
         outerHeight: window.outerHeight,
+        visibilityState: document.visibilityState,
+        hidden: document.hidden,
+        hasFocus: document.hasFocus(),
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        screenWidth: screen.width,
+        screenHeight: screen.height,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        cookieEnabled: navigator.cookieEnabled,
+        doNotTrack: navigator.doNotTrack,
+        maxTouchPoints: navigator.maxTouchPoints,
+        pdfViewerEnabled: navigator.pdfViewerEnabled,
+        webdriverProto: Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator), 'webdriver'),
+        chromeApp: typeof window.chrome?.app,
+        chromeCsi: typeof window.chrome?.csi,
+        chromeLoadTimes: typeof window.chrome?.loadTimes,
+        permissionsQuery: typeof navigator.permissions?.query,
+        mediaCodecsMp4: (function(){ try { var v=document.createElement('video'); return v.canPlayType('video/mp4; codecs="avc1.42E01E"'); } catch(e){ return 'err'; } })(),
+        mediaCodecsWebm: (function(){ try { var v=document.createElement('video'); return v.canPlayType('video/webm; codecs="vp8, vorbis"'); } catch(e){ return 'err'; } })(),
+        iframeContentWindow: (function(){ try { var f=document.createElement('iframe'); document.body.appendChild(f); var r=typeof f.contentWindow; document.body.removeChild(f); return r; } catch(e){ return 'err:'+e.message; } })(),
       })`,
       returnByValue: true,
     }) as { result: { value: string } };
