@@ -186,10 +186,16 @@ async function ensureChromeRunning(): Promise<void> {
     await sendCDPSession(ws, attachResult.sessionId, "Runtime.enable", {});
 
     // Inject stealth init script
+    // v0.0.0.12: Added maxTouchPoints=0 patch — critical for desktop UA.
+    //   Our UA says "Windows NT 10.0; Win64; x64" (desktop Chrome), but
+    //   if the host machine has a touchscreen, navigator.maxTouchPoints
+    //   returns 10 instead of 0. Aliyun detects this UA/touch mismatch
+    //   as a bot signal → F001. Force maxTouchPoints=0 to match desktop.
     await sendCDPSession(ws, attachResult.sessionId, "Page.addScriptToEvaluateOnNewDocument", {
       source: STEALTH_EVASIONS + "\n" +
         `try { Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true }); } catch(e) {}
-         try { if (!navigator.userAgentData) { Object.defineProperty(navigator, 'userAgentData', { get: () => ({ brands: [{brand:' Not A(Brand',version:'99'},{brand:'Chromium',version:'131'},{brand:'Google Chrome',version:'131'}], mobile: false, platform: 'Windows' }), configurable: true }); } } catch(e) {}`,
+         try { if (!navigator.userAgentData) { Object.defineProperty(navigator, 'userAgentData', { get: () => ({ brands: [{brand:' Not A(Brand',version:'99'},{brand:'Chromium',version:'131'},{brand:'Google Chrome',version:'131'}], mobile: false, platform: 'Windows' }), configurable: true }); } } catch(e) {}
+         try { Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0, configurable: true }); } catch(e) {}`,
     });
 
     // Set UA override
