@@ -1,5 +1,38 @@
 # zcode-proxy 使用说明
 
+> **v0.0.0.9 — 彻底抛弃 Playwright, 用纯 CDP 协议直连 Chrome**
+>
+> v0.0.0.7 的 `pipe: false` 没生效, 仍然 30 秒超时。诊断发现 Playwright 在 Bun 下有 3 个连续的 bug, 逐个修复后仍然失败。本版本完全抛弃 Playwright, 用 Bun 原生 WebSocket + 手写 CDP (Chrome DevTools Protocol) 命令直连 Chrome, 彻底解决所有问题。
+>
+> **Playwright 在 Bun 下的 3 个 bug (全部无法绕过)**
+>
+> 1. **`__dirname` 硬编码** (v0.0.0.4 修): `playwright-core` 用 `__dirname` 找 `package.json`, `bun build --compile` 把 `__dirname` 硬编码成构建机器的 Linux 路径, Windows exe 找不到 → `chromium` 对象 `undefined`
+> 2. **`DevToolsActivePort` 文件不生成** (v0.0.0.8 修): Chrome for Testing 149 在某些 Windows 环境下不写 `DevToolsActivePort` 文件, Playwright 的 launch 永远等不到端口 → 30 秒超时
+> 3. **`connectOverCDP` 的 WebSocket 超时** (无法修): Playwright 的 WebSocket 实现在 Bun 下有 bug, `connectOverCDP` 卡在 `ws connecting` 步骤 → 30 秒超时。**Bun 原生 WebSocket 却能 2ms 连上同一地址**, 证明是 Playwright 的 WebSocket 实现问题, 不是 Bun 的问题
+>
+> **v0.0.0.9 方案: 纯 CDP, 零 Playwright 依赖**
+>
+> - **新增 `src/proxy/captcha-cdp.ts`**: 用 Bun 原生 `WebSocket` + 手写 CDP 命令
+>   - `spawn` chrome.exe, `--remote-debugging-port=9222` (固定端口)
+>   - `fetch http://127.0.0.1:9222/json/version` 拿 WebSocket URL
+>   - `new WebSocket(wsUrl)` 连接 (Bun 原生, 2ms 连上)
+>   - `Target.createTarget` 创建标签页
+>   - `Page.addScriptToEvaluateOnNewDocument` 注入 stealth 补丁
+>   - `Emulation.setUserAgentOverride` 设 UA + platform
+>   - `Page.navigate` 加载 Aliyun SDK (data URL)
+>   - `Runtime.evaluate` 调 `initAliyunCaptcha` + await 结果
+> - **删除 `src/proxy/captcha-playwright.ts`** (不再使用, 但保留文件以备参考)
+> - **删除 `scripts/patch-playwright.ts`** (不再需要 patch playwright-core)
+> - **`package.json` 删除 `chromium-bidi` 依赖**, build 脚本去掉 `--external chromium-bidi`
+> - **GitHub Actions workflow 删掉 patch 步骤**
+> - **`captcha.ts` 的 `getPwSolver()` 改为 import `captcha-cdp.js`**
+>
+> **本地实测**: chrome 启动 266ms + CDP 连接 211ms + SDK 加载 912ms + solve 1788ms = 总 3.4s。684 单测全过。tsc 干净。exe 编译成功 (PE32+, 817 modules)。
+>
+> **升级建议**: 所有 v0.0.0.7/v0.0.0.8 用户立即升级。之前的版本在 Windows exe 下 Playwright 必超时, v0.0.0.9 用纯 CDP 彻底解决。
+
+---
+
 > **v0.0.0.7 — 修复 Bun exe 在 Windows 下 stdio 管道 bug (pipe:false 强制 TCP 模式)**
 >
 > v0.0.0.6 仍然卡在 `Launching Chromium...` 30 秒后超时。手动测试发现 chrome.exe 本身能正常启动 (`DevTools listening on ws://127.0.0.1:9222/...`), 问题出在 Playwright 连不上 chrome。根因: Bun 编译的 exe 在 Windows 上 stdio 管道继承有 bug, Playwright 默认用 pipe 模式 (`--remote-debugging-pipe` 通过 stdin/stdout 通信) 连不上 chrome。本版本用 `pipe: false` 强制 TCP 端口模式。

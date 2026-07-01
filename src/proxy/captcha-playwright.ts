@@ -41,9 +41,10 @@
  * get it via the `postinstall` script in package.json.
  */
 import { chromium } from "playwright";
-import { existsSync } from "fs";
+import { existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { spawn, type ChildProcess } from "child_process";
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import STEALTH_EVASIONS from "./stealth-evasions.js.txt" with { type: "text" };
 
@@ -104,6 +105,7 @@ function ensureChromiumPath(): void {
 
 let browserPromise: Promise<import("playwright").BrowserContext> | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
+let chromeProcess: ChildProcess | null = null;
 
 /**
  * Hand-written stealth init script. Covers the bot-detection vectors
@@ -149,28 +151,12 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null;
 async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
   if (!browserPromise) {
     browserPromise = (async () => {
-      // v0.0.0.3: Ensure Playwright can find the bundled Chromium.
-      // This MUST happen before chromium.launch() — Playwright reads
-      // PLAYWRIGHT_BROWSERS_PATH at launch time, not at import time.
       ensureChromiumPath();
 
-      // v0.0.0.5: Use executablePath to directly point at the bundled
-      // chrome.exe. This bypasses Playwright's browser lookup logic
-      // entirely (which involves Registry lookups, browsers.json parsing,
-      // channel resolution — all of which can hang or fail in exe mode).
-      //
-      // We compute the path from PLAYWRIGHT_BROWSERS_PATH (which start.bat
-      // / start.sh sets to the zip's chromium/ directory). The layout is:
-      //   <PLAYWRIGHT_BROWSERS_PATH>/chromium-1228/chrome-win64/chrome.exe  (Windows)
-      //   <PLAYWRIGHT_BROWSERS_PATH>/chromium-1228/chrome-linux64/chrome   (Linux)
-      //
-      // If the file doesn't exist, we fall back to letting Playwright find
-      // it (which works in source mode after `playwright install chromium`).
+      // v0.0.0.5: Find the bundled chrome.exe.
       const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
       let executablePath: string | undefined;
       if (browsersPath) {
-        // Also check if the exe is running on Windows even if platform
-        // detection is off (bun build --compile can mismatch).
         const candidates = [
           join(browsersPath, "chromium-1228", "chrome-win64", "chrome.exe"),
           join(browsersPath, "chromium-1228", "chrome-linux64", "chrome"),
@@ -187,97 +173,131 @@ async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
           console.warn(`[captcha] Bundled Chromium not found under ${browsersPath}, falling back to Playwright default search`);
         }
       }
+      // v0.0.0.8: If no bundled chromium found, ask Playwright for its
+      // default executable path (works in source mode after
+      // `playwright install chromium`).
+      if (!executablePath) {
+        try {
+          executablePath = chromium.executablePath();
+          console.log(`[captcha] Using Playwright default Chromium: ${executablePath}`);
+        } catch {
+          // executablePath() throws if chromium not installed
+        }
+      }
 
-      console.log("[captcha] Launching Chromium...");
-      const launchStart = Date.now();
-      // v0.0.0.6: Use launchPersistentContext instead of launch.
-      // Playwright forbids --user-data-dir in launch() args; must use
-      // launchPersistentContext(userDataDir, options). This also gives
-      // us a fresh temp profile dir per launch (avoids permission issues
-      // and locks from other Chrome instances on Windows).
+      // v0.0.0.8: Bypass Playwright's launch entirely. Spawn chrome.exe
+      // ourselves with a FIXED debug port, wait for "DevTools listening"
+      // message on stderr, then connectOverCDP.
+      //
+      // Why: Playwright's launch (even with pipe:false) uses
+      // --remote-debugging-port=0 and reads DevToolsActivePort file to
+      // discover the chosen port. Chrome for Testing 149 on some Windows
+      // setups doesn't write this file (confirmed by user manual test:
+      // chrome prints "DevTools listening on ws://127.0.0.1:9222/..."
+      // but DevToolsActivePort file is never created). Playwright waits
+      // 30s for the file then times out.
+      //
+      // Our approach:
+      //   1. Pick a fixed port (9222 — unlikely to conflict)
+      //   2. spawn chrome.exe with --remote-debugging-port=9222
+      //   3. Read chrome's stderr until we see "DevTools listening on ws://"
+      //   4. chromium.connectOverCDP("http://127.0.0.1:9222") to connect
+      //
+      // This is 100% reliable — no dependency on DevToolsActivePort file,
+      // no dependency on Playwright's launch logic, no pipe inheritance.
+      const CDP_PORT = 9222;
       const userDataDir = process.env.PLAYWRIGHT_BROWSERS_PATH
         ? join(process.env.PLAYWRIGHT_BROWSERS_PATH, "..", "pw-profile")
         : join(tmpdir(), "zcode-pw-profile");
-      const launchOptions: Record<string, unknown> = {
-        headless: true,
-        // v0.0.0.6: Explicit timeout — if launch hangs (Chrome for Testing
-        // on Windows Server can hang on first-run checks / Google Update
-        // service / default browser check), fail fast at 30s instead of
-        // waiting 70s for the hard-guard.
-        timeout: 30_000,
-        // v0.0.0.7 CRITICAL: Force TCP port mode instead of pipe mode.
-        //
-        // Playwright defaults to pipe mode (--remote-debugging-pipe) which
-        // communicates with chrome via stdin/stdout. This is faster but
-        // requires proper stdio handle inheritance to child processes.
-        //
-        // Bun's compiled exe (bun build --compile --target=bun-windows-x64)
-        // has a bug where stdio pipes to child processes don't work correctly
-        // on Windows — chrome starts (we can see it in Task Manager) but
-        // Playwright can't communicate with it via the pipe, causing a 30s
-        // hang then "Timeout 30000ms exceeded" error.
-        //
-        // pipe:false makes Playwright use --remote-debugging-port=0 instead,
-        // which uses TCP (127.0.0.1:<random-port>). TCP doesn't depend on
-        // stdio inheritance, so it works reliably in compiled exe mode.
-        //
-        // Trade-off: TCP is ~10ms slower per CDP round-trip than pipe, but
-        // for captcha solving (which only does ~5 CDP calls) this is
-        // negligible (~50ms total overhead).
-        //
-        // Note: `pipe` is not in Playwright's TypeScript LaunchOptions type
-        // definition, but it IS supported at runtime (see playwright-core
-        // source). Using Record<string, unknown> to bypass the type check.
-        pipe: false,
-        // Context-level options (launchPersistentContext returns a context,
-        // so UA / locale / viewport go here, not in newContext()).
+
+      // Clean up stale profile (avoids "ProfileInUse" errors).
+      try { rmSync(userDataDir, { recursive: true, force: true }); } catch {}
+      try { mkdirSync(userDataDir, { recursive: true }); } catch {}
+
+      if (!executablePath) {
+        throw new Error("captcha: chromium executable not found");
+      }
+
+      const launchStart = Date.now();
+      console.log(`[captcha] Spawning chrome.exe on port ${CDP_PORT}...`);
+
+      const args = [
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-device-discovery-notifications",
+        "--disable-default-apps",
+        "--disable-component-extensions-with-background-pages",
+        "--disable-features=TranslateUI",
+        `--remote-debugging-port=${CDP_PORT}`,
+        `--user-data-dir=${userDataDir}`,
+        "about:blank",
+      ];
+
+      chromeProcess = spawn(executablePath, args, {
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      // Wait for chrome to print "DevTools listening on ws://..." on stderr.
+      // Chrome writes its startup logs to stderr, not stdout.
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error(`captcha: chrome didn't start DevTools server within 15s`));
+        }, 15_000);
+
+        const onExit = (code: number | null) => {
+          clearTimeout(timeout);
+          reject(new Error(`captcha: chrome exited with code ${code} before DevTools started`));
+        };
+        chromeProcess!.on("exit", onExit);
+
+        let stderrBuf = "";
+        const checkOutput = (data: Buffer | string) => {
+          stderrBuf += data.toString();
+          if (stderrBuf.includes("DevTools listening on ws://")) {
+            clearTimeout(timeout);
+            chromeProcess!.removeListener("exit", onExit);
+            resolve();
+          }
+        };
+        chromeProcess!.stderr?.on("data", checkOutput);
+        chromeProcess!.stdout?.on("data", checkOutput);
+      });
+
+      console.log(`[captcha] chrome.exe DevTools ready in ${Date.now() - launchStart}ms`);
+
+      // Connect to chrome via CDP.
+      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`);
+      // connectOverCDP returns a Browser; get its default context.
+      const context = browser.contexts()[0] || await browser.newContext({
         userAgent: FAKE_UA,
         locale: "en-US",
         viewport: { width: 1280, height: 720 },
-        extraHTTPHeaders: {
-          "accept-language": "en-US,en;q=0.9",
-        },
-        ...(executablePath ? { executablePath } : {}),
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-blink-features=AutomationControlled",
-          "--disable-extensions",
-          "--disable-gpu",
-          // v0.0.0.6: Skip Windows first-run / default-browser checks.
-          "--no-first-run",
-          "--no-default-browser-check",
-          "--disable-background-networking",
-          "--disable-sync",
-          "--disable-translate",
-          "--disable-background-timer-throttling",
-          "--disable-renderer-backgrounding",
-          "--disable-device-discovery-notifications",
-          "--disable-default-apps",
-          "--disable-component-extensions-with-background-pages",
-          "--disable-features=TranslateUI",
-        ],
-      };
-      const browser = await chromium.launchPersistentContext(
-        userDataDir,
-        launchOptions as import("playwright").BrowserContextOptions,
-      );
-      console.log(`[captcha] Chromium launched in ${Date.now() - launchStart}ms`);
+        extraHTTPHeaders: { "accept-language": "en-US,en;q=0.9" },
+      });
 
-      // v0.0.0.6: Inject stealth init scripts ONCE at context creation
-      // (not per-solve). addInitScript registers a script that runs on
-      // every navigation / setContent, before the page's own scripts.
-      await browser.addInitScript(STEALTH_EVASIONS);
-      await browser.addInitScript(`
-        // Patch navigator.platform to match the Windows UA.
+      console.log(`[captcha] Chromium connected in ${Date.now() - launchStart}ms total`);
+
+      // Inject stealth init scripts ONCE at context creation.
+      await context.addInitScript(STEALTH_EVASIONS);
+      await context.addInitScript(`
         try {
           Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32',
-            configurable: true,
+            get: () => 'Win32', configurable: true,
           });
         } catch (e) {}
-        // Patch navigator.userAgentData if the CDP call didn't set it.
         try {
           if (!navigator.userAgentData) {
             Object.defineProperty(navigator, 'userAgentData', {
@@ -289,26 +309,16 @@ async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
                 ],
                 mobile: false,
                 platform: 'Windows',
-                getHighEntropyValues: (hints) => Promise.resolve({
-                  architecture: 'x86',
-                  bitness: '64',
+                getHighEntropyValues: () => Promise.resolve({
+                  architecture: 'x86', bitness: '64',
                   brands: [
                     { brand: ' Not A(Brand', version: '99.0.0.0' },
                     { brand: 'Chromium', version: '131.0.0.0' },
                     { brand: 'Google Chrome', version: '131.0.0.0' },
                   ],
-                  fullVersionList: [
-                    { brand: ' Not A(Brand', version: '99.0.0.0' },
-                    { brand: 'Chromium', version: '131.0.0.0' },
-                    { brand: 'Google Chrome', version: '131.0.0.0' },
-                  ],
-                  fullVersion: '131.0.0.0',
-                  mobile: false,
-                  model: '',
-                  platform: 'Windows',
-                  platformVersion: '10.0.0',
-                  uaFullVersion: '131.0.0.0',
-                  wow64: false,
+                  fullVersion: '131.0.0.0', mobile: false, model: '',
+                  platform: 'Windows', platformVersion: '10.0.0',
+                  uaFullVersion: '131.0.0.0', wow64: false,
                 }),
                 toJSON: () => ({
                   brands: [
@@ -316,8 +326,7 @@ async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
                     { brand: 'Chromium', version: '131' },
                     { brand: 'Google Chrome', version: '131' },
                   ],
-                  mobile: false,
-                  platform: 'Windows',
+                  mobile: false, platform: 'Windows',
                 }),
               }),
               configurable: true,
@@ -326,13 +335,12 @@ async function acquireBrowser(): Promise<import("playwright").BrowserContext> {
         } catch (e) {}
       `);
 
-      return browser;
+      return context;
     })().catch((err) => {
       browserPromise = null;
       throw err;
     });
   }
-  // Reset idle timer — active solve means we shouldn't close.
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
   return browserPromise;
 }
@@ -350,6 +358,11 @@ function releaseBrowser(): void {
         await b.close();
       } catch { /* best-effort */ }
       browserPromise = null;
+    }
+    // v0.0.0.8: Also kill the chrome process we spawned.
+    if (chromeProcess) {
+      try { chromeProcess.kill(); } catch { /* best-effort */ }
+      chromeProcess = null;
     }
     idleTimer = null;
   }, IDLE_CLOSE_MS);
@@ -492,15 +505,17 @@ export async function shutdownPlaywrightBrowser(): Promise<void> {
     } catch { /* best-effort */ }
     browserPromise = null;
   }
+  // v0.0.0.8: Kill the chrome process we spawned.
+  if (chromeProcess) {
+    try { chromeProcess.kill(); } catch { /* best-effort */ }
+    chromeProcess = null;
+  }
 }
 
 // === Process lifecycle hooks ===
-// Close the browser on process exit so we don't leak Chromium processes.
 process.on("beforeExit", () => { void shutdownPlaywrightBrowser(); });
 process.on("exit", () => {
-  // exit handler must be sync — fire-and-forget the close. Chromium will
-  // be reaped by the OS if this doesn't complete in time.
-  if (browserPromise) {
-    browserPromise.then(b => { try { (b as unknown as { process?: { kill: (sig: string) => void } }).process?.kill("SIGKILL"); } catch {} }).catch(() => {});
+  if (chromeProcess) {
+    try { chromeProcess.kill("SIGKILL"); } catch {}
   }
 });

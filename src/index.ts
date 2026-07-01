@@ -16,7 +16,7 @@ import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 
-const VERSION = "0.0.0.7";
+const VERSION = "0.0.0.9";
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover

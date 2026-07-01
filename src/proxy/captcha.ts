@@ -89,13 +89,13 @@ const CAPTCHA_SOLVER_MODE = (process.env.ZCODE_CAPTCHA_SOLVER || "auto").toLower
 const USE_PLAYWRIGHT = CAPTCHA_SOLVER_MODE !== "jsdom";
 const USE_JSDOM_FALLBACK = CAPTCHA_SOLVER_MODE !== "playwright";
 
-// Lazy-import Playwright solver so environments without the dependency
-// installed (e.g. legacy deployments that haven't run `bun install`
-// after upgrading) don't crash at module load.
-let _solveInPlaywright: typeof import("./captcha-playwright.js").solveInPlaywright | null = null;
+// v0.0.0.9: Lazy-import the CDP solver (pure CDP, no Playwright dependency).
+// This replaces the Playwright-based solver which had 3 unfixable bugs
+// under bun build --compile on Windows (see captcha-cdp.ts for details).
+let _solveInPlaywright: typeof import("./captcha-cdp.js").solveInPlaywright | null = null;
 async function getPwSolver() {
   if (!_solveInPlaywright) {
-    const mod = await import("./captcha-playwright.js");
+    const mod = await import("./captcha-cdp.js");
     _solveInPlaywright = mod.solveInPlaywright;
   }
   return _solveInPlaywright;
